@@ -23,6 +23,24 @@ const statePath = path.join(root, '.creator-flow-state.json');
 try { const saved = JSON.parse(fs.readFileSync(statePath, 'utf8')); tasks.push(...(saved.tasks || [])); proxies.push(...(saved.proxies || [])); videos.push(...(saved.videos || [])); } catch {}
 function saveState() { fs.writeFileSync(statePath, JSON.stringify({ tasks, proxies, videos }, null, 2)); }
 function addLog(message, taskId = null, level = 'info') { logs.unshift({ id: crypto.randomUUID(), timestamp: new Date().toISOString(), taskId, level, message }); if (logs.length > 500) logs.pop(); }
+async function startQueuedTask(task) {
+  if (task.status !== 'queued') return task;
+  task.status = 'starting-profile'; task.updatedAt = new Date().toISOString(); addLog(`Запуск запланированной задачи для профиля ${task.profileId}`, task.id);
+  try {
+    task.profileResult = await dolphinClient.startProfile(task.profileId);
+    const payload = task.profileResult?.data || task.profileResult;
+    task.wsEndpoint = payload?.wsEndpoint || payload?.automation?.wsEndpoint || payload?.remoteDebuggingAddress || payload?.remote_debugging_address || null;
+    task.status = 'profile-ready'; task.message = 'Профиль запущен. Готов к браузерному этапу публикации.';
+    addLog(`Профиль запущен${task.wsEndpoint ? ', адрес браузера получен' : ', адрес браузера не найден в ответе API'}`, task.id, task.wsEndpoint ? 'info' : 'warn');
+  } catch (error) { task.status = 'error'; task.error = error.message; addLog(`Ошибка запуска профиля: ${error.message}`, task.id, 'error'); }
+  task.updatedAt = new Date().toISOString(); saveState(); return task;
+}
+async function processScheduledTasks() {
+  const now = Date.now();
+  for (const task of tasks) if (task.status === 'queued' && task.scheduledAt && Date.parse(task.scheduledAt) <= now) await startQueuedTask(task);
+}
+const scheduler = setInterval(() => { processScheduledTasks().catch(error => addLog(`Ошибка планировщика: ${error.message}`, null, 'error')); }, 5000);
+scheduler.unref();
 
 app.use(express.json());
 app.use(express.static(root));
@@ -106,21 +124,7 @@ app.post('/api/tasks/:id/run', async (req, res) => {
   const task = tasks.find(item => item.id === req.params.id);
   if (!task) return res.status(404).json({ error: 'Задача не найдена' });
   if (task.status === 'running') return res.status(409).json({ error: 'Задача уже выполняется' });
-  task.status = 'starting-profile'; task.updatedAt = new Date().toISOString(); addLog(`Запуск профиля ${task.profileId}`, task.id);
-  try {
-    task.profileResult = await dolphinClient.startProfile(task.profileId);
-    const payload = task.profileResult?.data || task.profileResult;
-    task.wsEndpoint = payload?.wsEndpoint || payload?.automation?.wsEndpoint || payload?.remoteDebuggingAddress || payload?.remote_debugging_address || null;
-    task.status = 'profile-ready';
-    task.message = 'Профиль запущен. Готов к браузерному этапу публикации.';
-    addLog(`Профиль запущен${task.wsEndpoint ? ', адрес браузера получен' : ', адрес браузера не найден в ответе API'}`, task.id, task.wsEndpoint ? 'info' : 'warn');
-  } catch (error) {
-    task.status = 'error'; task.error = error.message;
-    addLog(`Ошибка запуска профиля: ${error.message}`, task.id, 'error');
-  }
-  task.updatedAt = new Date().toISOString();
-  saveState();
-  res.json(task);
+  res.json(await startQueuedTask(task));
 });
 
 app.post('/api/tasks/:id/upload', async (req, res) => {
