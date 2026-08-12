@@ -1,0 +1,4 @@
+# Один прокси на строку:
+# host:port
+# host:port:login:password
+# Поддерживаются HTTP, HTTPS и SOCKS5 — тип выбирается при привязке к профилю.
