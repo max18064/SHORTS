@@ -1,4 +1,4 @@
-const state = { health: null, profiles: [], tasks: [], library: [], channelTasks: [], logs: [], proxies: [], settings: null, worker: null, accountStates: new Map(), analytics: new Map() };
+const state = { health: null, profiles: [], tasks: [], library: [], channelTasks: [], logs: [], proxies: [], settings: null, worker: null, accountStates: new Map(), analytics: new Map(), studioBatches: [] };
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
 const pageNames = { overview: 'Главная', profiles: 'Профили Dolphin', accounts: 'Аккаунты YouTube', queue: 'Очередь задач', library: 'Библиотека', channels: 'Каналы', processing: 'Обработка', analytics: 'Аналитика', settings: 'Настройки' };
@@ -55,7 +55,7 @@ function activatePage(id) {
   $$('.page').forEach(page => page.classList.toggle('active', page.id === id));
   $('#page-title').textContent = pageNames[id] || 'Creator Flow';
   if (id === 'accounts') renderAccounts();
-  if (id === 'analytics') refreshAnalyticsView().catch(() => {});
+  if (id === 'analytics') Promise.all([refreshAnalyticsView(), loadStudioBatches()]).catch(() => {});
   if (id === 'settings') refreshSettings().catch(() => {});
 }
 
@@ -168,7 +168,7 @@ async function refreshAll() {
   $('#refresh-all').disabled = true;
   try {
     await loadHealth();
-    await Promise.all([loadProfiles(), loadTasks(), loadLibrary(), loadChannelTasks(), loadLogs(), loadProxies(), loadFfmpeg(), loadWorkerSettings()]);
+    await Promise.all([loadProfiles(), loadTasks(), loadLibrary(), loadChannelTasks(), loadLogs(), loadProxies(), loadFfmpeg(), loadWorkerSettings(), loadStudioBatches()]);
     await refreshAnalyticsView();
   } catch (error) {
     const notice = $('#connection-notice'); notice.className = 'notice error'; notice.textContent = error.message;
@@ -333,6 +333,58 @@ function renderAnalytics(record) {
   target.innerHTML = videos.length ? videos.map(video => `<div class="analytics-row"><div><b>${escapeHtml(video.title)}</b><div class="small">${escapeHtml(video.status || 'статус не прочитан')} · ${escapeHtml(video.date || 'дата не прочитана')}</div></div><div class="right">${escapeHtml(video.views || '—')}<div class="small">просмотры</div></div><div class="small right">${video.url ? `<a href="${escapeHtml(video.url)}" target="_blank" rel="noreferrer">Открыть</a>` : 'ссылка не найдена'}</div></div>`).join('') : '<div class="empty">Нет синхронизированных данных. Выберите профиль и нажмите «Синхронизировать».</div>';
 }
 
+function batchSummary(batch) {
+  const items = batch.items || [];
+  const total = Number(batch.total ?? items.length);
+  const completed = Number(batch.completed ?? items.filter(item => item.status === 'completed').length);
+  const failed = Number(batch.failed ?? items.filter(item => item.status === 'error').length);
+  const running = Number(batch.running ?? items.filter(item => item.status === 'running').length);
+  const queued = Number(batch.queued ?? Math.max(0, total - completed - failed - running));
+  return { total, completed, failed, running, queued };
+}
+
+function renderStudioBatches() {
+  const target = $('#analytics-batches');
+  if (!target) return;
+  if (!state.studioBatches.length) {
+    target.innerHTML = '<div class="empty">Пакетных синхронизаций пока нет.</div>';
+    return;
+  }
+  target.innerHTML = state.studioBatches.slice(0, 8).map(batch => {
+    const summary = batchSummary(batch);
+    const details = (batch.items || []).filter(item => item.status === 'error').slice(0, 3)
+      .map(item => `${escapeHtml(item.profileId)}: ${escapeHtml(item.error || 'ошибка')}`).join('<br>');
+    return `<div class="list-row"><div><b>Пакет ${escapeHtml(String(batch.id).slice(0, 8))}</b><div class="meta">${formatDate(batch.createdAt)} · ${escapeHtml(batch.status || 'queued')}</div>${details ? `<div class="small error">${details}</div>` : ''}</div><div class="right"><b>${summary.completed}/${summary.total}</b><div class="small">готово · ${summary.running} в работе · ${summary.queued} в очереди${summary.failed ? ` · ${summary.failed} ошибок` : ''}</div></div></div>`;
+  }).join('');
+}
+
+async function loadStudioBatches() {
+  const response = await api('/api/studio/sync-batches');
+  state.studioBatches = response.batches || [];
+  renderStudioBatches();
+}
+
+async function syncAllAnalytics() {
+  if (!state.profiles.length) return setMessage('#analytics-message', 'Нет профилей Dolphin для пакетной синхронизации.', 'error');
+  const button = $('#analytics-sync-all');
+  button.disabled = true;
+  button.textContent = 'Создание пакета…';
+  try {
+    const response = await api('/api/studio/sync-batches', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profileIds: state.profiles.map(profileIdOf) }),
+    });
+    await Promise.all([loadStudioBatches(), loadLogs(), loadWorkerSettings()]);
+    setMessage('#analytics-message', `Пакет создан: ${response.batch?.total || state.profiles.length} профилей поставлены в очередь.`, '');
+  } catch (error) {
+    setMessage('#analytics-message', error.message, 'error');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Синхронизировать все';
+  }
+}
+
 async function syncAnalytics(restart = false) {
   const profileId = $('#analytics-profile').value;
   if (!profileId) return setMessage('#analytics-message', 'Выберите профиль Dolphin.', 'error');
@@ -380,6 +432,7 @@ function bindEvents() {
   $('#render-form').onsubmit = renderVideo;
   $('#analytics-profile').onchange = refreshAnalyticsView;
   $('#analytics-sync').onclick = () => syncAnalytics(false);
+  $('#analytics-sync-all').onclick = syncAllAnalytics;
   $('#proxy-import').onclick = importProxies;
   $('#settings-save-concurrency').onclick = saveWorkerSettings;
 }

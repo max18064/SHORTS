@@ -17,6 +17,7 @@ const apiBase = process.env.DOLPHIN_API_BASE || 'https://anty-api.com';
 const localApi = process.env.DOLPHIN_LOCAL_API || 'http://localhost:3001';
 const token = process.env.DOLPHIN_API_TOKEN;
 const dolphinAutomation = process.env.DOLPHIN_AUTOMATION !== '0';
+const backgroundEnabled = process.env.CREATOR_FLOW_BACKGROUND !== '0';
 const dolphinClient = createDolphinClient({ baseUrl: apiBase, token, automation: dolphinAutomation });
 const tasks = [];
 const proxies = [];
@@ -24,6 +25,7 @@ const videos = [];
 const channelTasks = [];
 const library = [];
 const studioCache = {};
+const studioSyncBatches = [];
 const automationSessions = {};
 const settings = { maxConcurrentTasks: 5 };
 const logs = [];
@@ -33,6 +35,7 @@ const automationEndpoints = new Map();
 const activeOperations = new Map();
 const lockedManualProfiles = new Map();
 let schedulerRunning = false;
+let studioBatchPumpRunning = false;
 const execFileAsync = promisify(execFile);
 const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
 const ffprobeBin = process.env.FFPROBE_PATH || (path.basename(ffmpegBin).toLowerCase().startsWith('ffmpeg') ? path.join(path.dirname(ffmpegBin), process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe') : 'ffprobe');
@@ -59,6 +62,7 @@ if (fs.existsSync(statePath)) {
     channelTasks.push(...(saved.channelTasks || []));
     library.push(...(saved.library || []));
     Object.assign(studioCache, saved.studioCache || {});
+    studioSyncBatches.push(...(saved.studioSyncBatches || []));
     Object.assign(automationSessions, saved.automationSessions || {});
     if (saved.settings && Number.isFinite(Number(saved.settings.maxConcurrentTasks))) {
       settings.maxConcurrentTasks = Math.min(Math.max(Math.round(Number(saved.settings.maxConcurrentTasks)), 1), 20);
@@ -84,11 +88,21 @@ for (const task of tasks) {
     stateNeedsCleanup = true;
   }
 }
+for (const batch of studioSyncBatches) {
+  for (const item of batch.items || []) {
+    if (item.status === 'running') {
+      item.status = 'queued';
+      item.message = 'Синхронизация будет продолжена после перезапуска локальной панели.';
+      item.updatedAt = new Date().toISOString();
+      stateNeedsCleanup = true;
+    }
+  }
+}
 function saveState() {
   if (stateLoadError) {
     throw new Error('Локальное состояние не прочитано; исходный файл сохранён как резервная копия. Восстановите его перед изменением данных.');
   }
-  const payload = JSON.stringify({ tasks, proxies, videos, channelTasks, library, studioCache, automationSessions, settings }, null, 2);
+  const payload = JSON.stringify({ tasks, proxies, videos, channelTasks, library, studioCache, studioSyncBatches, automationSessions, settings }, null, 2);
   const tempPath = `${statePath}.${process.pid}.${Date.now()}.tmp`;
   try {
     fs.writeFileSync(tempPath, payload);
@@ -355,9 +369,12 @@ function queueProfileOperation({ key, profileId, work, allowManualSessionTaskId 
       return await work();
     } finally {
       activeOperations.delete(key);
-      queueMicrotask(() => {
-        processScheduledTasks().catch(error => addLog(`Ошибка планировщика: ${error.message}`, null, 'error'));
-      });
+      if (backgroundEnabled) {
+        queueMicrotask(() => {
+          processScheduledTasks().catch(error => addLog(`Ошибка планировщика: ${error.message}`, null, 'error'));
+          processStudioSyncBatches().catch(error => addLog(`Ошибка очереди пакетной синхронизации: ${error.message}`, null, 'error'));
+        });
+      }
     }
   })();
   return { started: true, promise: operation.promise };
@@ -425,7 +442,11 @@ async function runTaskUpload(task) {
   saveState();
   return task;
 }
-const scheduler = setInterval(() => { processScheduledTasks().catch(error => addLog(`Ошибка планировщика: ${error.message}`, null, 'error')); }, 5000);
+const scheduler = setInterval(() => {
+  if (!backgroundEnabled) return;
+  processScheduledTasks().catch(error => addLog(`Ошибка планировщика: ${error.message}`, null, 'error'));
+  processStudioSyncBatches().catch(error => addLog(`Ошибка очереди пакетной синхронизации: ${error.message}`, null, 'error'));
+}, 5000);
 scheduler.unref();
 const manualSessionJanitor = setInterval(() => { expireManualSessions().catch(error => addLog(`Ошибка очистки ручных сессий: ${error.message}`, null, 'error')); }, 60_000);
 manualSessionJanitor.unref();
@@ -523,6 +544,124 @@ async function syncProfileVideos(profileId, { restart = false, limit = 100 } = {
   return { profileId, status: 'synced', syncedAt: studioCache[profileId].syncedAt, videos: normalized, total: normalized.length, url: result.url };
 }
 
+function summarizeStudioBatch(batch) {
+  const items = Array.isArray(batch?.items) ? batch.items : [];
+  const counts = items.reduce((result, item) => {
+    result[item.status] = (result[item.status] || 0) + 1;
+    return result;
+  }, {});
+  return {
+    total: items.length,
+    queued: counts.queued || 0,
+    running: counts.running || 0,
+    completed: counts.completed || 0,
+    failed: counts.error || 0,
+    manualLoginRequired: counts['manual-login-required'] || 0,
+  };
+}
+
+function refreshStudioBatchStatus(batch) {
+  const summary = summarizeStudioBatch(batch);
+  const status = summary.queued || summary.running
+    ? 'running'
+    : summary.manualLoginRequired
+      ? 'needs-login'
+      : summary.failed
+        ? 'completed-with-errors'
+        : 'completed';
+  if (batch.status !== status) {
+    batch.status = status;
+    batch.updatedAt = new Date().toISOString();
+  }
+  return summary;
+}
+
+function publicStudioBatch(batch) {
+  const summary = summarizeStudioBatch(batch);
+  return {
+    id: batch.id,
+    createdAt: batch.createdAt,
+    updatedAt: batch.updatedAt,
+    status: batch.status,
+    limit: batch.limit,
+    ...summary,
+    items: (batch.items || []).map(item => ({
+      profileId: item.profileId,
+      status: item.status,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      syncedAt: item.syncedAt || null,
+      total: Number(item.total || 0),
+      error: item.error || '',
+      message: item.message || '',
+    })),
+  };
+}
+
+async function runStudioBatchItem(batch, item) {
+  item.status = 'running';
+  item.error = '';
+  item.message = 'Считываем список роликов из YouTube Studio.';
+  item.updatedAt = new Date().toISOString();
+  refreshStudioBatchStatus(batch);
+  saveState();
+  try {
+    const result = await syncProfileVideos(item.profileId, { limit: batch.limit });
+    if (result.status === 'manual-login-required') {
+      item.status = 'manual-login-required';
+      item.message = 'В этом профиле нужно завершить ручной вход в YouTube.';
+    } else {
+      item.status = 'completed';
+      item.total = result.total;
+      item.syncedAt = result.syncedAt;
+      item.message = `Считано роликов: ${result.total}.`;
+    }
+  } catch (error) {
+    item.status = 'error';
+    item.error = error.message;
+    item.message = 'Синхронизация не выполнена.';
+    addLog(`Ошибка пакетной синхронизации профиля ${item.profileId}: ${error.message}`, null, 'error');
+  }
+  item.updatedAt = new Date().toISOString();
+  refreshStudioBatchStatus(batch);
+  saveState();
+}
+
+async function processStudioSyncBatches() {
+  if (studioBatchPumpRunning) return;
+  studioBatchPumpRunning = true;
+  try {
+    let changed = false;
+    for (const batch of studioSyncBatches) {
+      if (!['queued', 'running'].includes(batch.status)) continue;
+      for (const item of batch.items || []) {
+        if (item.status !== 'queued') continue;
+        if (workerOccupiedProfiles().size >= settings.maxConcurrentTasks) return;
+        const operation = queueProfileOperation({
+          key: `studio-batch:${batch.id}:${item.profileId}`,
+          profileId: item.profileId,
+          work: () => runStudioBatchItem(batch, item),
+        });
+        if (operation.started) {
+          operation.promise
+            .catch(error => addLog(`Ошибка фоновой пакетной синхронизации: ${error.message}`, null, 'error'))
+            .finally(() => {
+              if (backgroundEnabled) processStudioSyncBatches().catch(error => addLog(`Ошибка очереди пакетной синхронизации: ${error.message}`, null, 'error'));
+            });
+        } else if (operation.code === 'workers-busy') {
+          return;
+        }
+      }
+      const before = batch.status;
+      refreshStudioBatchStatus(batch);
+      changed = changed || batch.status !== before;
+    }
+    if (changed) saveState();
+  } finally {
+    studioBatchPumpRunning = false;
+  }
+}
+
 app.post('/api/profiles/:id/youtube-status', async (req, res) => {
   const operation = queueProfileOperation({
     key: `inspect:${req.params.id}`,
@@ -566,7 +705,10 @@ app.patch('/api/settings', (req, res) => {
     }
     settings.maxConcurrentTasks = requested;
     saveState();
-    processScheduledTasks().catch(error => addLog(`Ошибка планировщика: ${error.message}`, null, 'error'));
+    if (backgroundEnabled) {
+      processScheduledTasks().catch(error => addLog(`Ошибка планировщика: ${error.message}`, null, 'error'));
+      processStudioSyncBatches().catch(error => addLog(`Ошибка очереди пакетной синхронизации: ${error.message}`, null, 'error'));
+    }
   }
   res.json({ settings: { ...settings }, worker: workerState() });
 });
@@ -574,6 +716,32 @@ app.get('/api/studio-videos', (req, res) => {
   const profileId = String(req.query.profileId || '');
   const record = studioCache[profileId];
   res.json(record || { profileId, syncedAt: null, videos: [], total: 0 });
+});
+app.get('/api/studio/sync-batches', (_req, res) => {
+  res.json({ batches: studioSyncBatches.slice(0, 20).map(publicStudioBatch) });
+});
+app.post('/api/studio/sync-batches', (req, res) => {
+  const rawIds = Array.isArray(req.body?.profileIds) ? req.body.profileIds : [];
+  const profileIds = [...new Set(rawIds.map(value => String(value || '').trim()).filter(Boolean))];
+  if (!profileIds.length) return res.status(400).json({ error: 'Выберите хотя бы один профиль Dolphin.' });
+  if (profileIds.length > 100) return res.status(400).json({ error: 'За один пакет можно добавить не более 100 профилей.' });
+  const requestedLimit = Number(req.body?.limit || 100);
+  const limit = Number.isInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 500) : 100;
+  const now = new Date().toISOString();
+  const batch = {
+    id: crypto.randomUUID(),
+    createdAt: now,
+    updatedAt: now,
+    status: 'queued',
+    limit,
+    items: profileIds.map(profileId => ({ profileId, status: 'queued', createdAt: now, updatedAt: now })),
+  };
+  studioSyncBatches.unshift(batch);
+  if (studioSyncBatches.length > 20) studioSyncBatches.splice(20);
+  refreshStudioBatchStatus(batch);
+  saveState();
+  if (backgroundEnabled) processStudioSyncBatches().catch(error => addLog(`Ошибка запуска пакетной синхронизации: ${error.message}`, null, 'error'));
+  res.status(202).json({ batch: publicStudioBatch(batch), worker: workerState() });
 });
 app.get('/api/channels/tasks', (_req, res) => res.json({ tasks: channelTasks }));
 app.get('/api/videos/stats', (_req, res) => {
@@ -760,7 +928,7 @@ app.post('/api/tasks', (req, res) => {
   const task = { id: crypto.randomUUID(), profileId, videoPath, title, description, tags: Array.isArray(tags) ? tags : [], scheduledAt, autoUpload: Boolean(autoUpload), status: 'queued', createdAt: new Date().toISOString() };
   tasks.push(task);
   saveState();
-  if (task.autoUpload) queueMicrotask(() => processScheduledTasks().catch(error => addLog(`Ошибка автоматического запуска: ${error.message}`, task.id, 'error')));
+  if (backgroundEnabled && task.autoUpload) queueMicrotask(() => processScheduledTasks().catch(error => addLog(`Ошибка автоматического запуска: ${error.message}`, task.id, 'error')));
   res.status(201).json(publicTask(task));
 });
 

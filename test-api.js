@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 process.env.PORT = '0';
+process.env.CREATOR_FLOW_BACKGROUND = '0';
 const testStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'creator-flow-test-'));
 process.env.CREATOR_FLOW_STATE_PATH = path.join(testStateDir, 'state.json');
 const productionStatePath = path.join(process.cwd(), '.creator-flow-state.json');
@@ -38,6 +39,17 @@ try {
   assert.ok(stats.count >= 1 && stats.over300 >= 1);
   const studioVideos = await (await fetch(`${base}/api/studio-videos?profileId=test-profile`)).json();
   assert.equal(studioVideos.total, 0);
+  const createdBatchResponse = await fetch(`${base}/api/studio/sync-batches`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ profileIds: ['test-profile', 'test-profile'] }),
+  });
+  assert.equal(createdBatchResponse.status, 202);
+  const createdBatch = await createdBatchResponse.json();
+  assert.equal(createdBatch.batch.total, 1);
+  const batches = await (await fetch(`${base}/api/studio/sync-batches`)).json();
+  assert.equal(batches.batches.length, 1);
+  assert.equal(batches.batches[0].queued, 1);
   const channelTask = await (await fetch(`${base}/api/channels/tasks`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ profileId: 'test-profile', name: 'Test channel', description: 'Test description', links: [{ title: 'Site', url: 'https://example.com' }] }) })).json();
   assert.equal(channelTask.status, 'queued');
   const channelTasks = await (await fetch(`${base}/api/channels/tasks`)).json();
