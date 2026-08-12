@@ -6,7 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { createDolphinClient } from './dolphin-client.js';
-import { uploadOwnVideo } from './upload-worker.js';
+import { openUploadSession, uploadIntoSession, uploadOwnVideo } from './upload-worker.js';
 
 const app = express();
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -18,6 +18,7 @@ const tasks = [];
 const proxies = [];
 const videos = [];
 const logs = [];
+const uploadSessions = new Map();
 const execFileAsync = promisify(execFile);
 const statePath = path.join(root, '.creator-flow-state.json');
 try { const saved = JSON.parse(fs.readFileSync(statePath, 'utf8')); tasks.push(...(saved.tasks || [])); proxies.push(...(saved.proxies || [])); videos.push(...(saved.videos || [])); } catch {}
@@ -146,6 +147,27 @@ app.post('/api/tasks/:id/upload', async (req, res) => {
   task.updatedAt = new Date().toISOString();
   saveState();
   res.json(task);
+});
+
+app.post('/api/tasks/:id/prepare-login', async (req, res) => {
+  const task = tasks.find(item => item.id === req.params.id);
+  if (!task) return res.status(404).json({ error: 'Задача не найдена' });
+  const wsEndpoint = task.wsEndpoint || getAutomationEndpoint(task.profileResult);
+  try {
+    const session = await openUploadSession({ wsEndpoint });
+    uploadSessions.set(task.id, session); task.status = session.needsLogin ? 'manual-login-required' : 'login-ready'; task.updatedAt = new Date().toISOString();
+    addLog(session.needsLogin ? 'Открыт YouTube: требуется ручной вход' : 'Профиль уже авторизован в YouTube', task.id, session.needsLogin ? 'warn' : 'info'); saveState(); res.json({ task, needsLogin: session.needsLogin });
+  } catch (error) { task.status = 'error'; task.error = error.message; addLog(`Ошибка открытия YouTube: ${error.message}`, task.id, 'error'); saveState(); res.status(422).json(task); }
+});
+
+app.post('/api/tasks/:id/upload/continue', async (req, res) => {
+  const task = tasks.find(item => item.id === req.params.id); const session = uploadSessions.get(req.params.id);
+  if (!task || !session) return res.status(404).json({ error: 'Сессия ручного входа не найдена' });
+  try {
+    const result = await uploadIntoSession({ session, videoPath: task.videoPath, title: task.title, description: task.description, tags: task.tags });
+    if (result.status === 'manual-login-required') return res.status(409).json({ error: 'Вход ещё не выполнен', task });
+    await session.browser.close(); uploadSessions.delete(task.id); task.uploadResult = result; task.status = 'awaiting-review'; task.updatedAt = new Date().toISOString(); addLog('Ручной вход подтверждён, видео загружено в форму', task.id); saveState(); res.json(task);
+  } catch (error) { await session.browser.close().catch(() => {}); uploadSessions.delete(task.id); task.status = 'error'; task.error = error.message; addLog(`Ошибка продолжения загрузки: ${error.message}`, task.id, 'error'); saveState(); res.status(422).json(task); }
 });
 
 app.post('/api/tasks', (req, res) => {
