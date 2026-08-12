@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 process.env.PORT = '0';
 process.env.CREATOR_FLOW_STATE_PATH = path.join(process.cwd(), '.test-state.json');
 try { fs.unlinkSync(process.env.CREATOR_FLOW_STATE_PATH); } catch {}
@@ -25,5 +27,14 @@ try {
   assert.ok(stats.count >= 1 && stats.over300 >= 1);
   const uniqueizer = await (await fetch(`${base}/api/uniqueizer/health`)).json();
   assert.equal(typeof uniqueizer.available, 'boolean');
+  if (uniqueizer.available) {
+    const execFileAsync = promisify(execFile);
+    const inputPath = path.join(process.cwd(), '.test-input.mp4');
+    const outputPath = path.join(process.cwd(), '.test-output.mp4');
+    await execFileAsync(process.env.FFMPEG_PATH || 'ffmpeg', ['-y', '-f', 'lavfi', '-i', 'color=c=blue:s=160x90:d=0.2', '-c:v', 'libx264', inputPath]);
+    const render = await (await fetch(`${base}/api/uniqueizer/render`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ inputPath, outputPath }) })).json();
+    assert.equal(render.status, 'completed'); assert.ok(fs.existsSync(outputPath));
+    fs.unlinkSync(inputPath); fs.unlinkSync(outputPath);
+  }
   console.log('API smoke test passed');
 } finally { server.close(); try { fs.unlinkSync(process.env.CREATOR_FLOW_STATE_PATH); } catch {} }

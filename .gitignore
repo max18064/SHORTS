@@ -4,3 +4,6 @@ node_modules/
 dist/
 .creator-flow-state.json
 .test-state.json
+work-tools/
+.test-input.mp4
+.test-output.mp4
