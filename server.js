@@ -28,8 +28,11 @@ function saveState() { fs.writeFileSync(statePath, JSON.stringify({ tasks, proxi
 function addLog(message, taskId = null, level = 'info') { logs.unshift({ id: crypto.randomUUID(), timestamp: new Date().toISOString(), taskId, level, message }); if (logs.length > 500) logs.pop(); }
 function getAutomationEndpoint(result) {
   const payload = result?.data || result || {};
-  const candidate = payload.wsEndpoint || payload.automation?.wsEndpoint || payload.remoteDebuggingAddress || payload.remote_debugging_address || payload.debuggerAddress || payload.debugger_address;
+  const automation = payload.automation || {};
+  const candidate = payload.wsEndpoint || automation.wsEndpoint || payload.remoteDebuggingAddress || payload.remote_debugging_address || payload.debuggerAddress || payload.debugger_address;
+  if (candidate && String(candidate).startsWith('/devtools/') && automation.port) return `ws://127.0.0.1:${automation.port}${candidate}`;
   if (candidate) return String(candidate).startsWith('ws') ? candidate : `http://${candidate}`;
+  if (automation.port) return `http://127.0.0.1:${automation.port}`;
   if (payload.selenium_port) return `http://127.0.0.1:${payload.selenium_port}`;
   return null;
 }
