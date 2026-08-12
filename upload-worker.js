@@ -13,6 +13,12 @@ export async function openUploadSession({ wsEndpoint }) {
 export async function uploadIntoSession({ session, videoPath, title, description = '', tags = [] }) {
   const { page } = session;
   if (/accounts\.google\.com|ServiceLogin/i.test(page.url())) return { status: 'manual-login-required', url: page.url() };
+  // YouTube Studio may show a one-time onboarding dialog after login.
+  const onboarding = page.getByRole('dialog').filter({ hasText: /добро пожаловать.*творческую студию|welcome.*youtube studio/i });
+  if (await onboarding.count()) {
+    const close = onboarding.getByRole('button', { name: /закрыть|close/i });
+    if (await close.count()) await close.click();
+  }
   await page.getByRole('button', { name: /^(создать|create)$/i }).click();
   const chooserPromise = page.waitForEvent('filechooser');
   await page.getByText(/загрузить видео|upload videos/i).click();
