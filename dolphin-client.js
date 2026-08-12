@@ -4,7 +4,7 @@ const jsonHeaders = token => ({
   Authorization: `Bearer ${token}`
 });
 
-export function createDolphinClient({ baseUrl, token }) {
+export function createDolphinClient({ baseUrl, token, automation = true }) {
   async function request(path, options = {}) {
     const response = await fetch(`${baseUrl}${path}`, {
       ...options,
@@ -17,7 +17,7 @@ export function createDolphinClient({ baseUrl, token }) {
   }
   return {
     listProfiles: () => request('/v1.0/browser_profiles?limit=100'),
-    startProfile: id => request(`/v1.0/browser_profiles/${encodeURIComponent(id)}/start`),
+    startProfile: id => request(`/v1.0/browser_profiles/${encodeURIComponent(id)}/start${automation ? '?automation=1' : ''}`),
     stopProfile: id => request(`/v1.0/browser_profiles/${encodeURIComponent(id)}/stop`),
     profile: id => request(`/v1.0/browser_profiles/${encodeURIComponent(id)}`),
     request
