@@ -13,7 +13,7 @@ export async function openUploadSession({ wsEndpoint }) {
 export async function uploadIntoSession({ session, videoPath, title, description = '', tags = [] }) {
   const { page } = session;
   if (/accounts\.google\.com|ServiceLogin/i.test(page.url())) return { status: 'manual-login-required', url: page.url() };
-  await page.getByRole('button', { name: /создать|create/i }).click();
+  await page.getByRole('button', { name: /^(создать|create)$/i }).click();
   const chooserPromise = page.waitForEvent('filechooser');
   await page.getByText(/загрузить видео|upload videos/i).click();
   const chooser = await chooserPromise;
