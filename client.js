@@ -1,102 +1,484 @@
-const api = async (url, options) => { const response = await fetch(url, options); const data = await response.json(); if (!response.ok) throw new Error(data.error || data.message || 'Ошибка API'); return data; };
-const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
-async function refreshCreatorFlow(){ const settings=document.querySelector('#settings .card'); if(!settings||document.querySelector('#cf-api-panel')) return; const panel=document.createElement('div'); panel.id='cf-api-panel'; panel.className='field'; panel.innerHTML='<label>Управление Dolphin</label><div class="row"><select class="input" id="cf-profile"><option>Загрузка профилей...</option></select><button class="btn" id="cf-profile-refresh">Обновить</button></div><div class="row" style="margin-top:8px"><button class="btn green" id="cf-profile-start">Запустить</button><button class="btn danger" id="cf-profile-stop">Остановить</button></div><small id="cf-profile-status">Ожидание подключения</small>'; settings.appendChild(panel); const select=panel.querySelector('#cf-profile'), status=panel.querySelector('#cf-profile-status'); const load=async()=>{try{const payload=await api('/api/profiles');const profiles=payload.data||payload.profiles||payload.items||[];select.innerHTML=profiles.length?profiles.map(p=>`<option value="${p.id||p.uuid}">${p.name||p.title||p.id||p.uuid}</option>`).join(''):'<option value="">Профили не найдены</option>';status.textContent=`Профилей получено: ${profiles.length}`;}catch(e){select.innerHTML='<option value="">Dolphin недоступен</option>';status.textContent=e.message;}}; panel.querySelector('#cf-profile-refresh').onclick=load; panel.querySelector('#cf-profile-start').onclick=async()=>{if(!select.value)return;status.textContent='Запуск профиля...';try{await api(`/api/profiles/${encodeURIComponent(select.value)}/start`,{method:'POST'});status.textContent='Профиль запущен';}catch(e){status.textContent=e.message;}}; panel.querySelector('#cf-profile-stop').onclick=async()=>{if(!select.value)return;status.textContent='Остановка профиля...';try{await api(`/api/profiles/${encodeURIComponent(select.value)}/stop`,{method:'POST'});status.textContent='Профиль остановлен';}catch(e){status.textContent=e.message;}}; await load(); }
-document.addEventListener('DOMContentLoaded', async () => { await refreshCreatorFlow(); try { const health = await api('/api/health'); document.title = health.remoteApi ? 'Creator Flow · Dolphin online' : 'Creator Flow · Dolphin offline'; } catch {} });
+const state = { health: null, profiles: [], tasks: [], library: [], channelTasks: [], logs: [], proxies: [], settings: null, worker: null, accountStates: new Map(), analytics: new Map() };
+const $ = selector => document.querySelector(selector);
+const $$ = selector => [...document.querySelectorAll(selector)];
+const pageNames = { overview: 'Главная', profiles: 'Профили Dolphin', accounts: 'Аккаунты YouTube', queue: 'Очередь задач', library: 'Библиотека', channels: 'Каналы', processing: 'Обработка', analytics: 'Аналитика', settings: 'Настройки' };
 
-async function refreshQueue() {
-  const target = document.querySelector('#full-queue');
+async function api(url, options = {}) {
+  const response = await fetch(url, options);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(payload.error || payload.message || `Ошибка сервера (${response.status})`);
+    error.code = payload.code;
+    throw error;
+  }
+  return payload;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
+}
+
+function formatDate(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' });
+}
+
+function formatNumber(value) { return Number(value || 0).toLocaleString('ru-RU'); }
+function formatSize(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes)) return '—';
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} КБ`;
+  return `${(bytes / 1024 / 1024).toFixed(bytes >= 1024 * 1024 * 1024 ? 0 : 1)} МБ`;
+}
+function formatDuration(value) {
+  const seconds = Math.round(Number(value || 0));
+  if (!Number.isFinite(seconds) || seconds <= 0) return '—';
+  const minutes = Math.floor(seconds / 60); const rest = seconds % 60;
+  return `${minutes}:${String(rest).padStart(2, '0')}`;
+}
+function statusPill(status) {
+  const type = /error|cancelled|manual-login-required|recovery-needed/.test(status) ? 'error' : /queued|starting|uploading|awaiting|scheduled/.test(status) ? 'wait' : '';
+  return `<span class="pill ${type}">${escapeHtml(status)}</span>`;
+}
+function setMessage(target, text, type = '') {
+  const element = typeof target === 'string' ? $(target) : target;
+  if (!element) return;
+  element.textContent = text || '';
+  element.className = `state-line ${type}`;
+}
+function profileIdOf(profile) { return String(profile.id || profile.uuid || ''); }
+function profileNameOf(profile) { return profile.name || profile.title || profileIdOf(profile); }
+
+function activatePage(id) {
+  $$('.nav button').forEach(button => button.classList.toggle('active', button.dataset.page === id));
+  $$('.page').forEach(page => page.classList.toggle('active', page.id === id));
+  $('#page-title').textContent = pageNames[id] || 'Creator Flow';
+  if (id === 'accounts') renderAccounts();
+  if (id === 'analytics') refreshAnalyticsView().catch(() => {});
+  if (id === 'settings') refreshSettings().catch(() => {});
+}
+
+function fillProfileSelect(select, preferred = '') {
+  if (!select) return;
+  const previous = preferred || select.value;
+  select.innerHTML = state.profiles.length
+    ? state.profiles.map(profile => `<option value="${escapeHtml(profileIdOf(profile))}">${escapeHtml(profileNameOf(profile))}</option>`).join('')
+    : '<option value="">Профили Dolphin не найдены</option>';
+  if ([...select.options].some(option => option.value === previous)) select.value = previous;
+}
+
+function fillLibrarySelect(select, includeBlank = true) {
+  if (!select) return;
+  const previous = select.value;
+  const blank = includeBlank ? '<option value="">Выберите файл</option>' : '';
+  select.innerHTML = blank + state.library.map(item => `<option value="${escapeHtml(item.filePath)}" data-title="${escapeHtml(item.fileName)}">${escapeHtml(item.fileName)} · ${formatDuration(item.durationSeconds)}</option>`).join('');
+  if ([...select.options].some(option => option.value === previous)) select.value = previous;
+}
+
+async function loadHealth() {
+  state.health = await api('/api/health');
+  const online = state.health.remoteApi && state.health.localReachable;
+  const localLabel = state.health.localReachable
+    ? 'локальное приложение отвечает'
+    : 'локальное приложение недоступно';
+  $('#side-status').textContent = online ? 'Dolphin подключён' : 'Проверьте Dolphin';
+  const notice = $('#connection-notice');
+  notice.className = `notice ${online ? '' : 'warn'}`;
+  notice.textContent = online
+    ? 'Creator Flow подключён к локальному Dolphin и его API. Данные страниц загружаются только по вашему действию.'
+    : `Статус: ${state.health.remoteApi ? 'API Dolphin доступен, но локальное приложение не отвечает.' : 'API Dolphin недоступен. Проверьте ключ и запущенное приложение Dolphin.'}`;
+  $('#settings-health').className = `notice ${online ? '' : 'warn'}`;
+  $('#settings-health').textContent = online ? 'Dolphin API и локальное приложение доступны.' : 'Нет полного подключения к Dolphin.';
+  $('#settings-automation').textContent = localLabel;
+}
+
+async function loadProfiles() {
+  const response = await api('/api/profiles');
+  state.profiles = response.data || response.profiles || response.items || [];
+  ['#task-profile', '#channel-profile', '#analytics-profile'].forEach(selector => fillProfileSelect($(selector)));
+  $('#metric-profiles').textContent = formatNumber(state.profiles.length);
+  renderProfiles(); renderAccounts();
+}
+
+async function loadTasks() {
+  const response = await api('/api/tasks');
+  state.tasks = response.tasks || [];
+  $('#metric-queue').textContent = formatNumber(state.tasks.filter(task => !['cancelled', 'awaiting-review'].includes(task.status)).length);
+  renderTasks(); renderOverviewTasks();
+}
+
+async function loadLibrary() {
+  const response = await api('/api/library');
+  state.library = response.library || [];
+  fillLibrarySelect($('#task-library')); fillLibrarySelect($('#render-source'), false);
+  $('#metric-library').textContent = formatNumber(state.library.length);
+  renderLibrary();
+}
+
+async function loadChannelTasks() {
+  const response = await api('/api/channels/tasks');
+  state.channelTasks = response.tasks || [];
+  renderChannelTasks();
+}
+
+async function loadLogs() {
+  const response = await api('/api/logs');
+  state.logs = response.logs || [];
+  renderLogs();
+}
+
+async function loadProxies() {
+  const response = await api('/api/proxies');
+  state.proxies = response.proxies || [];
+  renderProxies();
+}
+
+async function loadFfmpeg() {
+  const response = await api('/api/uniqueizer/health');
+  const element = $('#ffmpeg-status');
+  element.className = `notice ${response.available ? '' : 'warn'}`;
+  element.textContent = response.available ? `FFmpeg готов: ${response.version || response.path}` : response.message;
+  $('#settings-ffmpeg').textContent = response.available ? 'готов' : 'не найден';
+}
+
+function renderWorkerSettings() {
+  const select = $('#settings-concurrency');
+  if (!select || !state.settings) return;
+  const value = String(state.settings.maxConcurrentTasks || 5);
+  if (![...select.options].some(option => option.value === value)) {
+    select.insertAdjacentHTML('beforeend', `<option value="${escapeHtml(value)}">${escapeHtml(value)} потоков</option>`);
+  }
+  select.value = value;
+  const worker = state.worker || { active: 0, limit: value, lockedProfiles: 0 };
+  setMessage(
+    '#settings-worker',
+    `Глобальная очередь: занято ${worker.active} из ${worker.limit} слотов. Параллельно выполняются задачи только на разных профилях; на одном профиле — не более одной операции. Ручных сессий: ${worker.lockedProfiles}.`,
+  );
+}
+
+async function loadWorkerSettings() {
+  const response = await api('/api/settings');
+  state.settings = response.settings || null;
+  state.worker = response.worker || null;
+  renderWorkerSettings();
+}
+
+async function refreshAll() {
+  $('#refresh-all').disabled = true;
+  try {
+    await loadHealth();
+    await Promise.all([loadProfiles(), loadTasks(), loadLibrary(), loadChannelTasks(), loadLogs(), loadProxies(), loadFfmpeg(), loadWorkerSettings()]);
+    await refreshAnalyticsView();
+  } catch (error) {
+    const notice = $('#connection-notice'); notice.className = 'notice error'; notice.textContent = error.message;
+  } finally { $('#refresh-all').disabled = false; }
+}
+
+function renderProfiles() {
+  const target = $('#profiles-list');
+  if (!state.profiles.length) { target.innerHTML = '<div class="empty">Dolphin не вернул профили. Проверьте API-ключ и подключение.</div>'; return; }
+  target.innerHTML = state.profiles.map(profile => {
+    const id = profileIdOf(profile); const name = profileNameOf(profile);
+    return `<div class="profile-card"><div><b>${escapeHtml(name)}</b><div class="meta">ID: ${escapeHtml(id)} · ${escapeHtml(profile.platform || 'browser profile')}</div></div><div class="profile-actions"><button class="btn" data-profile-start="${escapeHtml(id)}">Запустить</button><button class="btn" data-profile-stop="${escapeHtml(id)}">Остановить</button><button class="btn primary" data-profile-channel="${escapeHtml(id)}">YouTube</button></div></div>`;
+  }).join('');
+  target.querySelectorAll('[data-profile-start]').forEach(button => button.onclick = () => controlProfile(button.dataset.profileStart, 'start', button));
+  target.querySelectorAll('[data-profile-stop]').forEach(button => button.onclick = () => controlProfile(button.dataset.profileStop, 'stop', button));
+  target.querySelectorAll('[data-profile-channel]').forEach(button => button.onclick = () => { fillProfileSelect($('#channel-profile'), button.dataset.profileChannel); activatePage('channels'); });
+}
+
+function renderAccounts() {
+  const target = $('#accounts-list');
   if (!target) return;
-  try {
-    const payload = await api('/api/tasks');
-    const tasks = payload.tasks || [];
-    if (!tasks.length) { target.innerHTML = '<div class="empty">Очередь пока пуста</div>'; return; }
-    target.innerHTML = tasks.map((task, index) => `<div class="task"><span class="num">${String(index + 1).padStart(2, '0')}</span><span><b>${escapeHtml(task.title)}</b><br><small>${escapeHtml(task.status)} · ${escapeHtml(task.profileId)}</small></span><span><span class="pill ${task.status === 'queued' ? 'wait' : ''}">${escapeHtml(task.status)}</span><br><button class="btn" data-run-task="${escapeHtml(task.id)}" data-action="run" style="padding:4px 7px;margin-top:5px">Профиль</button>${task.status === 'profile-ready' ? `<button class="btn green" data-run-task="${escapeHtml(task.id)}" data-action="upload" style="padding:4px 7px;margin-top:5px">Загрузить</button>` : ''}${task.status === 'manual-login-required' ? `<button class="btn green" data-run-task="${escapeHtml(task.id)}" data-action="upload" style="padding:4px 7px;margin-top:5px">Повторить загрузку</button>` : ''}${task.status === 'login-ready' ? `<button class="btn green" data-run-task="${escapeHtml(task.id)}" data-action="continue" style="padding:4px 7px;margin-top:5px">Продолжить загрузку</button>` : ''}</span></div>`).join('');
-    target.querySelectorAll('[data-run-task]').forEach(button => { button.onclick = async () => { button.disabled = true; button.textContent = '...'; try { const action = button.dataset.action; const endpoint = action === 'continue' ? `/api/tasks/${button.dataset.runTask}/upload/continue` : action === 'upload' ? `/api/tasks/${button.dataset.runTask}/upload` : `/api/tasks/${button.dataset.runTask}/run`; await api(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) }); await refreshQueue(); } catch (error) { button.disabled = false; button.textContent = error.message; } }; });
-  } catch (error) { target.innerHTML = `<div class="empty">${error.message}</div>`; }
+  if (!state.profiles.length) {
+    target.innerHTML = '<div class="empty">Профили Dolphin не найдены. Сначала обновите подключение к Dolphin.</div>';
+    return;
+  }
+  target.innerHTML = state.profiles.map(profile => {
+    const id = profileIdOf(profile);
+    const account = state.accountStates.get(id);
+    const status = account?.status === 'connected'
+      ? `Подключён: ${escapeHtml(account.channelName || 'канал прочитан')}`
+      : account?.status === 'manual-login-required'
+        ? 'Требуется ручной вход в YouTube'
+        : account?.error || 'Статус ещё не проверен';
+    const className = account?.status === 'connected' ? 'pill' : account?.status === 'manual-login-required' || account?.error ? 'pill error' : 'pill wait';
+    return `<div class="profile-card"><div><b>${escapeHtml(profileNameOf(profile))}</b><div class="meta">${escapeHtml(status)}</div></div><div class="profile-actions"><span class="${className}">${escapeHtml(account?.status || 'не проверен')}</span><button class="btn primary" data-account-check="${escapeHtml(id)}">Проверить YouTube</button></div></div>`;
+  }).join('');
+  target.querySelectorAll('[data-account-check]').forEach(button => button.onclick = () => checkAccount(button.dataset.accountCheck, button));
 }
 
-async function createQueueTask() {
-  const profileId = window.prompt('ID профиля Dolphin');
-  const videoPath = window.prompt('Полный путь к видео');
-  const title = window.prompt('Заголовок ролика');
-  if (!profileId || !videoPath || !title) return;
+async function checkAccount(id, button) {
+  const oldText = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Проверка…';
   try {
-    await api('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ profileId, videoPath, title }) });
-    await refreshQueue();
-    window.alert('Задача добавлена в очередь');
-  } catch (error) { window.alert(`Ошибка: ${error.message}`); }
+    const result = await api(`/api/profiles/${encodeURIComponent(id)}/youtube-status`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    state.accountStates.set(id, { ...result.channel, channelName: result.channel?.channelName || '' });
+    await loadLogs();
+  } catch (error) {
+    state.accountStates.set(id, { status: 'error', error: error.message });
+  } finally {
+    renderAccounts();
+    const replacement = $('#accounts-list').querySelector(`[data-account-check="${CSS.escape(id)}"]`);
+    if (replacement) { replacement.disabled = false; replacement.textContent = oldText; }
+  }
 }
 
-document.addEventListener('DOMContentLoaded', () => {
-  const add = document.querySelector('#add');
-  if (add) add.onclick = createQueueTask;
-  refreshQueue();
-  enhanceUniqueizer();
-  enhanceAnalytics();
-  refreshAnalyticsData();
-  enhanceOperations();
-  enhanceChannelManager();
+async function controlProfile(id, action, button) {
+  const oldText = button.textContent; button.disabled = true; button.textContent = '…';
+  try { await api(`/api/profiles/${encodeURIComponent(id)}/${action}`, { method: 'POST' }); await loadLogs(); button.textContent = action === 'start' ? 'Запущен' : 'Остановлен'; }
+  catch (error) { button.textContent = error.message; }
+  finally { setTimeout(() => { button.disabled = false; button.textContent = oldText; }, 1500); }
+}
+
+function renderTask(task) {
+  const actions = [];
+  if (task.status === 'queued') actions.push(`<button class="btn" data-task-action="run" data-task-id="${escapeHtml(task.id)}">Запустить</button>`);
+  if (task.status === 'profile-ready') actions.push(`<button class="btn primary" data-task-action="upload" data-task-id="${escapeHtml(task.id)}">Загрузить</button>`);
+  if (task.status === 'manual-login-required') {
+    actions.push(task.manualSessionOpen
+      ? `<button class="btn primary" data-task-action="continue-upload" data-task-id="${escapeHtml(task.id)}">Проверить вход</button>`
+      : `<button class="btn warning" data-task-action="prepare-login" data-task-id="${escapeHtml(task.id)}">Открыть вход</button>`);
+  }
+  if (task.status === 'login-ready') actions.push(`<button class="btn primary" data-task-action="continue-upload" data-task-id="${escapeHtml(task.id)}">Продолжить</button>`);
+  if (!['cancelled', 'awaiting-review', 'error'].includes(task.status)) actions.push(`<button class="btn danger" data-task-action="cancel" data-task-id="${escapeHtml(task.id)}">Отменить</button>`);
+  return `<div class="task"><span class="number">▸</span><span><b>${escapeHtml(task.title)}</b><br><small>${escapeHtml(task.profileId)} · ${task.scheduledAt ? `запуск ${formatDate(task.scheduledAt)}` : 'ручной запуск'}${task.message ? ` · ${escapeHtml(task.message)}` : ''}</small></span><div>${statusPill(task.status)}<div class="profile-actions" style="margin-top:7px">${actions.join('')}</div></div></div>`;
+}
+
+function renderTasks() {
+  const target = $('#queue-list');
+  target.innerHTML = state.tasks.length ? state.tasks.map(renderTask).join('') : '<div class="empty">Очередь пуста. Добавьте свой ролик и назначьте профиль Dolphin.</div>';
+  target.querySelectorAll('[data-task-action]').forEach(button => button.onclick = () => taskAction(button.dataset.taskId, button.dataset.taskAction, button));
+}
+
+function renderOverviewTasks() {
+  const target = $('#overview-tasks');
+  const active = state.tasks.filter(task => task.status !== 'cancelled').slice(0, 6);
+  target.innerHTML = active.length ? active.map(renderTask).join('') : '<div class="empty">Нет задач. Перейдите в «Очередь», чтобы добавить первую.</div>';
+  target.querySelectorAll('[data-task-action]').forEach(button => button.onclick = () => taskAction(button.dataset.taskId, button.dataset.taskAction, button));
+}
+
+async function taskAction(id, action, button) {
+  button.disabled = true; const oldText = button.textContent; button.textContent = '…';
+  try {
+    const endpoint = action === 'run'
+      ? `/api/tasks/${id}/run`
+      : action === 'upload'
+        ? `/api/tasks/${id}/upload`
+        : action === 'prepare-login'
+          ? `/api/tasks/${id}/prepare-login`
+          : action === 'continue-upload'
+            ? `/api/tasks/${id}/upload/continue`
+            : `/api/tasks/${id}/cancel`;
+    await api(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    await Promise.all([loadTasks(), loadLogs()]);
+  } catch (error) { button.textContent = error.message; button.disabled = false; setTimeout(() => { button.textContent = oldText; }, 2500); }
+}
+
+function renderLibrary() {
+  const target = $('#library-list');
+  target.innerHTML = state.library.length ? state.library.map(item => `<div class="list-row"><div><b>${escapeHtml(item.fileName)}</b><div class="file-meta"><span>${formatSize(item.sizeBytes)}</span><span>${formatDuration(item.durationSeconds)}</span><span>${item.video.width && item.video.height ? `${item.video.width}×${item.video.height}` : 'видео не найдено'}</span></div><div class="meta">${escapeHtml(item.filePath)}</div></div><button class="btn danger" data-library-remove="${escapeHtml(item.id)}">Убрать из списка</button></div>`).join('') : '<div class="empty">Библиотека пуста.</div>';
+  target.querySelectorAll('[data-library-remove]').forEach(button => button.onclick = () => removeLibraryItem(button.dataset.libraryRemove));
+}
+
+async function removeLibraryItem(id) {
+  await api(`/api/library/${id}`, { method: 'DELETE' });
+  await Promise.all([loadLibrary(), loadLogs()]);
+}
+
+function renderChannelTasks() {
+  const target = $('#channel-tasks');
+  target.innerHTML = state.channelTasks.length ? state.channelTasks.map(task => `<div class="task"><span class="number">✎</span><span><b>${escapeHtml(task.name || 'Изменение оформления')}</b><br><small>${escapeHtml(task.profileId)} · ${escapeHtml(task.status)}${task.message ? ` · ${escapeHtml(task.message)}` : ''}</small></span><div>${statusPill(task.status)} ${task.status === 'completed' ? '' : `<button class="btn primary" data-channel-task="${escapeHtml(task.id)}">Применить</button>`}</div></div>`).join('') : '<div class="empty">Задач оформления пока нет.</div>';
+  target.querySelectorAll('[data-channel-task]').forEach(button => button.onclick = () => runChannelTask(button.dataset.channelTask, button));
+}
+
+async function runChannelTask(id, button) {
+  button.disabled = true; button.textContent = '…';
+  try { await api(`/api/channels/tasks/${id}/run`, { method: 'POST' }); await Promise.all([loadChannelTasks(), loadLogs()]); }
+  catch (error) { button.textContent = error.message; button.disabled = false; }
+}
+
+function renderLogs() {
+  const build = logs => logs.length ? logs.map(log => `<div class="${escapeHtml(log.level)}">${formatDate(log.timestamp)} · ${escapeHtml(log.message)}</div>`).join('') : '<span class="hint">Операций пока нет.</span>';
+  $('#overview-logs').innerHTML = build(state.logs.slice(0, 12));
+  $('#operations-log').innerHTML = build(state.logs);
+}
+
+function renderProxies() {
+  const target = $('#proxy-list');
+  target.innerHTML = state.proxies.length ? state.proxies.slice(0, 30).map(proxy => `<div class="list-row"><div><b>${escapeHtml(proxy.host)}:${escapeHtml(proxy.port)}</b><div class="meta">${escapeHtml(proxy.type || 'http')} · ${escapeHtml(proxy.username || 'без логина')} · ${escapeHtml(proxy.status || 'не проверен')}</div></div></div>`).join('') : '<div class="empty">Прокси не импортированы.</div>';
+}
+
+function getAnalyticsRecord(profileId) { return state.analytics.get(profileId) || { profileId, videos: [], total: 0, syncedAt: null }; }
+
+async function refreshAnalyticsView() {
+  const select = $('#analytics-profile');
+  if (!select || !select.value) { renderAnalytics({ profileId: '', videos: [], total: 0, syncedAt: null }); return; }
+  try {
+    const record = await api(`/api/studio-videos?profileId=${encodeURIComponent(select.value)}`);
+    state.analytics.set(select.value, record); renderAnalytics(record);
+  } catch (error) { setMessage('#analytics-message', error.message, 'error'); }
+}
+
+function renderAnalytics(record) {
+  const videos = record.videos || [];
+  const parsedViews = videos.map(video => video.viewsNumber).filter(value => Number.isFinite(value));
+  $('#analytics-total').textContent = formatNumber(videos.length);
+  $('#analytics-views').textContent = parsedViews.length ? formatNumber(parsedViews.reduce((sum, value) => sum + value, 0)) : '—';
+  $('#analytics-sync-date').textContent = record.syncedAt ? formatDate(record.syncedAt) : '—';
+  $('#analytics-source').textContent = record.syncedAt ? 'YouTube Studio' : 'нет данных';
+  $('#metric-synced').textContent = formatNumber(videos.length);
+  const target = $('#analytics-list');
+  target.innerHTML = videos.length ? videos.map(video => `<div class="analytics-row"><div><b>${escapeHtml(video.title)}</b><div class="small">${escapeHtml(video.status || 'статус не прочитан')} · ${escapeHtml(video.date || 'дата не прочитана')}</div></div><div class="right">${escapeHtml(video.views || '—')}<div class="small">просмотры</div></div><div class="small right">${video.url ? `<a href="${escapeHtml(video.url)}" target="_blank" rel="noreferrer">Открыть</a>` : 'ссылка не найдена'}</div></div>`).join('') : '<div class="empty">Нет синхронизированных данных. Выберите профиль и нажмите «Синхронизировать».</div>';
+}
+
+async function syncAnalytics(restart = false) {
+  const profileId = $('#analytics-profile').value;
+  if (!profileId) return setMessage('#analytics-message', 'Выберите профиль Dolphin.', 'error');
+  const button = $('#analytics-sync'); button.disabled = true; button.textContent = restart ? 'Перезапуск…' : 'Синхронизация…';
+  try {
+    const result = await api(`/api/profiles/${encodeURIComponent(profileId)}/videos/sync`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ restart }) });
+    if (result.status === 'manual-login-required') { setMessage('#analytics-message', 'В этом профиле требуется ручной вход в YouTube.', 'error'); renderAnalytics(result); return; }
+    state.analytics.set(profileId, result); renderAnalytics(result); setMessage('#analytics-message', `Считано роликов: ${result.total}.`, ''); await loadLogs();
+  } catch (error) {
+    setMessage('#analytics-message', error.message, 'error');
+    if (error.code === 'profile-already-running') appendRestartButton('#analytics-message', () => syncAnalytics(true), 'Перезапустить и синхронизировать');
+  } finally { button.disabled = false; button.textContent = 'Синхронизировать'; }
+}
+
+function appendRestartButton(target, action, label) {
+  const element = typeof target === 'string' ? $(target) : target;
+  const button = document.createElement('button'); button.className = 'btn warning'; button.style.marginTop = '8px'; button.textContent = label; button.onclick = action; element.after(button);
+}
+
+async function refreshSettings() { await Promise.all([loadHealth(), loadLogs(), loadProxies(), loadFfmpeg(), loadWorkerSettings()]); }
+
+function bindEvents() {
+  $$('.nav button').forEach(button => button.onclick = () => activatePage(button.dataset.page));
+  $('#refresh-all').onclick = refreshAll;
+  $('#go-queue').onclick = () => activatePage('queue');
+  $('#profiles-refresh').onclick = () => loadProfiles().catch(error => alert(error.message));
+  $('#accounts-refresh').onclick = () => loadProfiles().catch(error => alert(error.message));
+  $('#task-library').onchange = event => {
+    const selected = state.library.find(item => item.filePath === event.target.value);
+    if (!selected) return;
+    $('#task-video-path').value = selected.filePath;
+    if (!$('#task-title').value) $('#task-title').value = selected.fileName.replace(/\.[^.]+$/, '');
+  };
+  $('#task-form').onsubmit = async event => {
+    event.preventDefault();
+    const scheduledValue = $('#task-scheduled').value;
+    const body = { profileId: $('#task-profile').value, videoPath: $('#task-video-path').value.trim(), title: $('#task-title').value.trim(), description: $('#task-description').value.trim(), tags: $('#task-tags').value.split(',').map(tag => tag.trim()).filter(Boolean), scheduledAt: scheduledValue ? new Date(scheduledValue).toISOString() : null, autoUpload: $('#task-auto-upload').checked };
+    try { await api('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); event.target.reset(); fillProfileSelect($('#task-profile')); fillLibrarySelect($('#task-library')); setMessage('#task-form-message', 'Задача добавлена в очередь.'); await Promise.all([loadTasks(), loadLogs()]); }
+    catch (error) { setMessage('#task-form-message', error.message, 'error'); }
+  };
+  $('#library-upload').onclick = uploadLibraryFiles;
+  $('#library-import-path').onclick = importLibraryPath;
+  $('#channel-read').onclick = () => readChannel(false);
+  $('#channel-form').onsubmit = createChannelTask;
+  $('#render-form').onsubmit = renderVideo;
+  $('#analytics-profile').onchange = refreshAnalyticsView;
+  $('#analytics-sync').onclick = () => syncAnalytics(false);
+  $('#proxy-import').onclick = importProxies;
+  $('#settings-save-concurrency').onclick = saveWorkerSettings;
+}
+
+async function saveWorkerSettings() {
+  const button = $('#settings-save-concurrency');
+  const previousSettings = state.settings ? { ...state.settings } : null;
+  const previousWorker = state.worker ? { ...state.worker } : null;
+  button.disabled = true;
+  try {
+    const response = await api('/api/settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ maxConcurrentTasks: Number($('#settings-concurrency').value) }),
+    });
+    state.settings = response.settings;
+    state.worker = response.worker;
+    renderWorkerSettings();
+  } catch (error) {
+    // Restore the last confirmed values immediately, then ask the server for
+    // its current state. This prevents a rejected selection from remaining in
+    // the control and looking as if it had been saved.
+    state.settings = previousSettings;
+    state.worker = previousWorker;
+    renderWorkerSettings();
+    try {
+      await loadWorkerSettings();
+      setMessage('#settings-worker', `Не удалось сохранить настройку: ${error.message}. Показано текущее значение сервера.`, 'error');
+    } catch (refreshError) {
+      setMessage('#settings-worker', `Не удалось сохранить настройку: ${error.message}. Показано последнее подтверждённое значение.`, 'error');
+    }
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function uploadLibraryFiles() {
+  const files = [...$('#library-files').files];
+  if (!files.length) return setMessage('#library-message', 'Выберите хотя бы один видеофайл.', 'error');
+  const button = $('#library-upload'); button.disabled = true;
+  try {
+    for (const file of files) {
+      setMessage('#library-message', `Копирование: ${file.name}`);
+      await api(`/api/library/upload?name=${encodeURIComponent(file.name)}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file });
+    }
+    $('#library-files').value = ''; setMessage('#library-message', `Добавлено файлов: ${files.length}.`); await Promise.all([loadLibrary(), loadLogs()]);
+  } catch (error) { setMessage('#library-message', error.message, 'error'); }
+  finally { button.disabled = false; }
+}
+
+async function importLibraryPath() {
+  const filePath = $('#library-path').value.trim();
+  if (!filePath) return setMessage('#library-message', 'Укажите полный путь к видеофайлу.', 'error');
+  try { const result = await api('/api/library/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filePath }) }); $('#library-path').value = ''; setMessage('#library-message', result.existing ? 'Этот файл уже есть в библиотеке.' : 'Файл добавлен в библиотеку.'); await Promise.all([loadLibrary(), loadLogs()]); }
+  catch (error) { setMessage('#library-message', error.message, 'error'); }
+}
+
+async function readChannel(restart = false) {
+  const profileId = $('#channel-profile').value; const target = $('#channel-identity');
+  target.textContent = restart ? 'Перезапуск профиля и чтение YouTube Studio…' : 'Чтение состояния YouTube Studio…';
+  try {
+    const result = await api(`/api/profiles/${encodeURIComponent(profileId)}/youtube-status`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ restart }) });
+    const channel = result.channel;
+    target.textContent = channel.status === 'connected' ? `Подключён канал: ${channel.channelName || 'название не прочитано'} · ${channel.url}` : channel.status === 'manual-login-required' ? 'В этом профиле требуется ручной вход в YouTube.' : 'Dolphin не выдал адрес Automation API.';
+    await loadLogs();
+  } catch (error) {
+    target.textContent = error.message;
+    if (error.code === 'profile-already-running') appendRestartButton(target, () => readChannel(true), 'Перезапустить и считать');
+  }
+}
+
+async function createChannelTask(event) {
+  event.preventDefault();
+  const links = $('#channel-links').value.split(/\r?\n/).map(line => line.split('|').map(part => part.trim())).filter(parts => parts[0] && parts[1]).map(([title, url]) => ({ title, url }));
+  const body = { profileId: $('#channel-profile').value, name: $('#channel-name').value.trim(), description: $('#channel-description').value.trim(), avatarPath: $('#channel-avatar').value.trim(), bannerPath: $('#channel-banner').value.trim(), links };
+  try { await api('/api/channels/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); event.target.reset(); fillProfileSelect($('#channel-profile')); await Promise.all([loadChannelTasks(), loadLogs()]); }
+  catch (error) { $('#channel-identity').textContent = error.message; }
+}
+
+async function renderVideo(event) {
+  event.preventDefault();
+  const source = $('#render-source').value;
+  const outputPath = $('#render-output').value.trim();
+  const overlayPath = $('#render-overlay').value.trim();
+  if (!source || !outputPath) return setMessage('#render-message', 'Выберите исходник и укажите путь к результату.', 'error');
+  setMessage('#render-message', 'Запущена локальная обработка…');
+  try { const response = await api('/api/uniqueizer/render', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ inputPath: source, outputPath, overlayPath }) }); setMessage('#render-message', `Готово: ${response.outputPath}`); await Promise.all([loadLibrary(), loadLogs()]); }
+  catch (error) { setMessage('#render-message', error.message, 'error'); }
+}
+
+async function importProxies() {
+  const text = $('#proxy-text').value.trim();
+  if (!text) return setMessage('#proxy-message', 'Вставьте список прокси.', 'error');
+  try { const result = await api('/api/proxies/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, type: $('#proxy-type').value }) }); $('#proxy-text').value = ''; setMessage('#proxy-message', `Импортировано: ${result.imported}; ошибочных строк: ${result.invalid}.`); await Promise.all([loadProxies(), loadLogs()]); }
+  catch (error) { setMessage('#proxy-message', error.message, 'error'); }
+}
+
+document.addEventListener('DOMContentLoaded', async () => {
+  bindEvents();
+  await refreshAll();
+  setInterval(() => loadLogs().catch(() => {}), 12_000);
 });
-
-function enhanceChannelManager() {
-  if (document.querySelector('#channels')) return;
-  const nav = document.querySelector('.nav[data-page="editor"]');
-  const page = document.createElement('section');
-  page.className = 'page'; page.id = 'channels';
-  page.innerHTML = '<div class="layout"><div class="card"><h2>Оформление YouTube-канала</h2><p class="hint">Выберите профиль Dolphin с уже выполненным ручным входом.</p><div id="cf-channel-panel"></div></div><div class="card"><h2>Задачи оформления</h2><div class="queue" id="cf-channel-tasks"></div></div></div>';
-  document.querySelector('main').appendChild(page);
-  const button = document.createElement('button'); button.className = 'nav'; button.dataset.page = 'channels'; button.innerHTML = '<i>◉</i>Каналы'; nav.before(button);
-  button.onclick = () => { document.querySelectorAll('.nav').forEach(item => item.classList.remove('active')); button.classList.add('active'); document.querySelectorAll('.page').forEach(item => item.classList.remove('active')); page.classList.add('active'); document.querySelector('#title').textContent = 'Каналы'; };
-  const panel = page.querySelector('#cf-channel-panel');
-  panel.innerHTML = '<div class="field"><label>Профиль Dolphin</label><div class="row"><select class="input" id="cf-channel-profile"><option>Загрузка профилей…</option></select><button class="btn" id="cf-channel-sync">Считать канал</button></div><small id="cf-channel-identity">Данные канала ещё не считаны.</small></div><div class="field"><label>Новое название канала</label><input class="input" id="cf-channel-name" placeholder="Название"></div><div class="field"><label>Новое описание</label><textarea class="input" id="cf-channel-description" rows="3" placeholder="Описание канала"></textarea></div><div class="formgrid"><div class="field"><label>Аватар (полный путь)</label><input class="input" id="cf-channel-avatar" placeholder="C:\\Images\\avatar.png"></div><div class="field"><label>Баннер (полный путь)</label><input class="input" id="cf-channel-banner" placeholder="C:\\Images\\banner.png"></div></div><div class="field"><label>Ссылки: название | URL, по одной в строке</label><textarea class="input" id="cf-channel-links" rows="3" placeholder="Telegram | https://t.me/example"></textarea></div><button class="btn green" id="cf-channel-create">Создать задачу оформления</button><small id="cf-channel-message" style="display:block;margin-top:8px"></small>';
-  const profileSelect = panel.querySelector('#cf-channel-profile');
-  const loadProfiles = async () => { try { const data = await api('/api/profiles'); const profiles = data.data || data.profiles || data.items || []; profileSelect.innerHTML = profiles.length ? profiles.map(profile => `<option value="${escapeHtml(profile.id || profile.uuid)}">${escapeHtml(profile.name || profile.title || profile.id || profile.uuid)}</option>`).join('') : '<option value="">Профили не найдены</option>'; } catch (error) { profileSelect.innerHTML = '<option value="">Dolphin недоступен</option>'; } };
-  const refreshTasks = async () => { const target = page.querySelector('#cf-channel-tasks'); try { const data = await api('/api/channels/tasks'); const tasks = data.tasks || []; target.innerHTML = tasks.length ? tasks.map(task => `<div class="task"><span class="num">◉</span><span><b>${escapeHtml(task.name || 'Оформление канала')}</b><br><small>${escapeHtml(task.profileId)} · ${escapeHtml(task.status)}</small></span><button class="btn ${task.status === 'completed' ? '' : 'green'}" data-channel-run="${escapeHtml(task.id)}" ${task.status === 'completed' ? 'disabled' : ''}>${task.status === 'completed' ? 'Готово' : 'Применить'}</button></div>`).join('') : '<div class="empty">Задач оформления пока нет</div>'; target.querySelectorAll('[data-channel-run]').forEach(item => item.onclick = async () => { item.disabled = true; item.textContent = '…'; try { await api(`/api/channels/tasks/${item.dataset.channelRun}/run`, { method: 'POST' }); await refreshTasks(); } catch (error) { item.textContent = error.message; } }); } catch (error) { target.textContent = error.message; } };
-  const syncChannel = async restart => { const note = panel.querySelector('#cf-channel-identity'); note.textContent = restart ? 'Перезапускаю профиль с Automation API и читаю YouTube Studio…' : 'Читаю YouTube Studio в выбранном профиле…'; try { const result = await api(`/api/profiles/${encodeURIComponent(profileSelect.value)}/youtube-status`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ restart }) }); const channel = result.channel; if (channel.status === 'connected') { note.textContent = `Подключён канал: ${channel.channelName} · ${channel.url}`; } else if (channel.status === 'manual-login-required') { note.textContent = 'YouTube просит выполнить вход в окне Dolphin.'; } else { note.textContent = 'Dolphin не выдал адрес автоматизации для этого профиля.'; } } catch (error) { note.textContent = error.message; if (error.message.includes('уже запущен')) { const restartButton = document.createElement('button'); restartButton.className = 'btn'; restartButton.style.marginTop = '8px'; restartButton.textContent = 'Перезапустить и считать'; restartButton.onclick = () => syncChannel(true); note.after(restartButton); } } };
-  panel.querySelector('#cf-channel-sync').onclick = () => syncChannel(false);
-  panel.querySelector('#cf-channel-create').onclick = async () => { const rawLinks = panel.querySelector('#cf-channel-links').value.split(/\r?\n/).map(line => line.split('|').map(value => value.trim())).filter(parts => parts[0] && parts[1]).map(([title, url]) => ({ title, url })); const body = { profileId: profileSelect.value, name: panel.querySelector('#cf-channel-name').value.trim(), description: panel.querySelector('#cf-channel-description').value.trim(), avatarPath: panel.querySelector('#cf-channel-avatar').value.trim(), bannerPath: panel.querySelector('#cf-channel-banner').value.trim(), links: rawLinks }; try { await api('/api/channels/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); panel.querySelector('#cf-channel-message').textContent = 'Задача добавлена. Нажмите «Применить», чтобы изменить выбранный канал.'; await refreshTasks(); } catch (error) { panel.querySelector('#cf-channel-message').textContent = error.message; } };
-  loadProfiles(); refreshTasks();
-}
-
-function enhanceOperations() {
-  const settings = document.querySelector('#settings .card');
-  if (!settings || document.querySelector('#cf-ops')) return;
-  const panel = document.createElement('div'); panel.id = 'cf-ops'; panel.className = 'field';
-  panel.innerHTML = '<h2>Прокси и журнал</h2><p class="hint">Прокси хранятся локально; пароли не выводятся в списке.</p><textarea id="cf-proxy-input" class="input" rows="4" placeholder="host:port\nhost:port:login:password"></textarea><div class="row" style="margin-top:8px"><select id="cf-proxy-type" class="input"><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks5">SOCKS5</option></select><button id="cf-proxy-save" class="btn">Импортировать прокси</button></div><div id="cf-proxy-status" class="hint" style="margin-top:8px"></div><div class="field"><label>FFmpeg</label><small id="cf-ffmpeg-status">Проверка FFmpeg...</small></div><div id="cf-log-list" class="log" style="height:120px;margin-top:12px">Загрузка журнала...</div>';
-  settings.appendChild(panel);
-  panel.querySelector('#cf-proxy-save').onclick = async () => { const text = panel.querySelector('#cf-proxy-input').value; if (!text.trim()) return; try { const result = await api('/api/proxies/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, type: panel.querySelector('#cf-proxy-type').value }) }); panel.querySelector('#cf-proxy-input').value = ''; panel.querySelector('#cf-proxy-status').textContent = `Импортировано: ${result.imported}, ошибочных строк: ${result.invalid}`; } catch (error) { panel.querySelector('#cf-proxy-status').textContent = error.message; } };
-  const loadLogs = async () => { try { const result = await api('/api/logs'); panel.querySelector('#cf-log-list').innerHTML = result.logs.length ? result.logs.map(log => `<div><b>${escapeHtml(log.level)}</b> ${escapeHtml(log.message)}</div>`).join('') : 'Журнал пуст'; } catch (error) { panel.querySelector('#cf-log-list').textContent = error.message; } };
-  const loadFfmpeg = async () => { try { const health = await api('/api/uniqueizer/health'); panel.querySelector('#cf-ffmpeg-status').textContent = health.available ? `Готов: ${health.path}` : health.message; } catch (error) { panel.querySelector('#cf-ffmpeg-status').textContent = error.message; } };
-  loadLogs(); loadFfmpeg(); setInterval(loadLogs, 5000);
-}
-
-function enhanceUniqueizer() {
-  const card = document.querySelector('#editor .layout .card');
-  if (!card || document.querySelector('#cf-unique-settings')) return;
-  const section = document.createElement('div'); section.id = 'cf-unique-settings'; section.className = 'field';
-  section.innerHTML = '<h2>Вариативность обработки</h2><p class="hint">Настройки применяются только к добавленным вами исходным роликам.</p><div class="field"><label>Количество вариантов: <b id="cf-variants-value">3</b></label><input type="range" id="cf-variants" min="1" max="20" value="3"></div><div class="field"><label>Папка с музыкой (необязательно)</label><input class="input" id="cf-music-path" placeholder="C:\\CreatorFlow\\music"></div><div class="field"><label>Громкость музыки: <b id="cf-volume-value">0.03</b></label><input type="range" id="cf-volume" min="0" max="0.2" step="0.01" value="0.03"></div><div class="formgrid"><div class="field"><label>Скорость минимум: <b id="cf-speed-low-value">1.00x</b></label><input type="range" id="cf-speed-low" min="0.8" max="1.3" step="0.01" value="1"></div><div class="field"><label>Скорость максимум: <b id="cf-speed-high-value">1.30x</b></label><input type="range" id="cf-speed-high" min="0.8" max="1.3" step="0.01" value="1.3"></div></div>';
-  card.appendChild(section);
-  const bind = (id, output, suffix = '') => { const input = section.querySelector(`#${id}`); const label = section.querySelector(`#${output}`); input.oninput = () => { label.textContent = input.value + suffix; }; };
-  bind('cf-variants', 'cf-variants-value'); bind('cf-volume', 'cf-volume-value'); bind('cf-speed-low', 'cf-speed-low-value', 'x'); bind('cf-speed-high', 'cf-speed-high-value', 'x');
-}
-
-function enhanceAnalytics() {
-  const page = document.querySelector('#analytics');
-  if (!page || document.querySelector('#cf-analytics-extra')) return;
-  const card = document.createElement('div'); card.id = 'cf-analytics-extra'; card.className = 'card'; card.style.marginTop = '18px';
-  card.innerHTML = '<h2>Детализация выборки</h2><div class="stats" style="margin-top:14px"><div class="stat"><b>55</b><span>нулевых просмотров</span></div><div class="stat"><b style="color:var(--green)">40</b><span>300+ просмотров</span></div><div class="stat"><b style="color:var(--red)">83</b><span>недоступных</span></div><div class="stat"><b>0</b><span>с пометкой 18+</span></div></div><div class="row" style="margin-top:16px"><button class="btn green">Обновить статистику</button><button class="btn danger">Удалить недоступные</button></div>';
-  page.appendChild(card);
-}
-
-async function refreshAnalyticsData() {
-  try {
-    const stats = await api('/api/videos/stats');
-    const values = document.querySelectorAll('#analytics .stats .metric b');
-    [stats.count, stats.views, stats.likes, stats.comments].forEach((value, index) => { if (values[index]) values[index].textContent = Number(value || 0).toLocaleString('ru-RU'); });
-    const summary = document.querySelector('#analytics .layout .card .queue');
-    if (summary) summary.innerHTML = `<div class="task"><span>Нулевые просмотры</span><b>${stats.zeroViews}</b></div><div class="task"><span>Ролики с 300+ просмотрами</span><b style="color:var(--green)">${stats.over300}</b></div><div class="task"><span>Недоступные позиции</span><b style="color:var(--red)">${stats.unavailable}</b></div>`;
-    const videos = await api('/api/videos');
-    const list = document.querySelector('#analytics .layout .card .list');
-    if (list) list.innerHTML = videos.videos.length ? videos.videos.slice().sort((a, b) => Number(b.views || 0) - Number(a.views || 0)).slice(0, 5).map(video => `<div class="item"><div class="thumb"></div><span><b>${escapeHtml(video.title)}</b><small>${escapeHtml(video.profileId)}</small></span><span class="numbers"><b>${Number(video.views || 0).toLocaleString('ru-RU')}</b><br>просмотров</span></div>`).join('') : '<div class="empty">Данные публикаций ещё не синхронизированы</div>';
-  } catch {}
-}

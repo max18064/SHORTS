@@ -7,3 +7,6 @@ dist/
 work-tools/
 .test-input.mp4
 .test-output.mp4
+data/
+server-output.log
+server-error.log
