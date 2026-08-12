@@ -1,4 +1,5 @@
 const api = async (url, options) => { const response = await fetch(url, options); const data = await response.json(); if (!response.ok) throw new Error(data.error || data.message || 'Ошибка API'); return data; };
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 async function refreshCreatorFlow(){ const settings=document.querySelector('#settings .card'); if(!settings||document.querySelector('#cf-api-panel')) return; const panel=document.createElement('div'); panel.id='cf-api-panel'; panel.className='field'; panel.innerHTML='<label>Управление Dolphin</label><div class="row"><select class="input" id="cf-profile"><option>Загрузка профилей...</option></select><button class="btn" id="cf-profile-refresh">Обновить</button></div><div class="row" style="margin-top:8px"><button class="btn green" id="cf-profile-start">Запустить</button><button class="btn danger" id="cf-profile-stop">Остановить</button></div><small id="cf-profile-status">Ожидание подключения</small>'; settings.appendChild(panel); const select=panel.querySelector('#cf-profile'), status=panel.querySelector('#cf-profile-status'); const load=async()=>{try{const payload=await api('/api/profiles');const profiles=payload.data||payload.profiles||payload.items||[];select.innerHTML=profiles.length?profiles.map(p=>`<option value="${p.id||p.uuid}">${p.name||p.title||p.id||p.uuid}</option>`).join(''):'<option value="">Профили не найдены</option>';status.textContent=`Профилей получено: ${profiles.length}`;}catch(e){select.innerHTML='<option value="">Dolphin недоступен</option>';status.textContent=e.message;}}; panel.querySelector('#cf-profile-refresh').onclick=load; panel.querySelector('#cf-profile-start').onclick=async()=>{if(!select.value)return;status.textContent='Запуск профиля...';try{await api(`/api/profiles/${encodeURIComponent(select.value)}/start`,{method:'POST'});status.textContent='Профиль запущен';}catch(e){status.textContent=e.message;}}; panel.querySelector('#cf-profile-stop').onclick=async()=>{if(!select.value)return;status.textContent='Остановка профиля...';try{await api(`/api/profiles/${encodeURIComponent(select.value)}/stop`,{method:'POST'});status.textContent='Профиль остановлен';}catch(e){status.textContent=e.message;}}; await load(); }
 document.addEventListener('DOMContentLoaded',refreshCreatorFlow);
 
@@ -9,7 +10,7 @@ async function refreshQueue() {
     const payload = await api('/api/tasks');
     const tasks = payload.tasks || [];
     if (!tasks.length) { target.innerHTML = '<div class="empty">Очередь пока пуста</div>'; return; }
-    target.innerHTML = tasks.map((task, index) => `<div class="task"><span class="num">${String(index + 1).padStart(2, '0')}</span><span><b>${task.title}</b><br><small>${task.status} · ${task.profileId}</small></span><span><span class="pill ${task.status === 'queued' ? 'wait' : ''}">${task.status}</span><br><button class="btn" data-run-task="${task.id}" data-action="run" style="padding:4px 7px;margin-top:5px">Профиль</button>${task.status === 'profile-ready' ? `<button class="btn green" data-run-task="${task.id}" data-action="upload" style="padding:4px 7px;margin-top:5px">Загрузить</button>` : ''}</span></div>`).join('');
+    target.innerHTML = tasks.map((task, index) => `<div class="task"><span class="num">${String(index + 1).padStart(2, '0')}</span><span><b>${escapeHtml(task.title)}</b><br><small>${escapeHtml(task.status)} · ${escapeHtml(task.profileId)}</small></span><span><span class="pill ${task.status === 'queued' ? 'wait' : ''}">${escapeHtml(task.status)}</span><br><button class="btn" data-run-task="${escapeHtml(task.id)}" data-action="run" style="padding:4px 7px;margin-top:5px">Профиль</button>${task.status === 'profile-ready' ? `<button class="btn green" data-run-task="${escapeHtml(task.id)}" data-action="upload" style="padding:4px 7px;margin-top:5px">Загрузить</button>` : ''}</span></div>`).join('');
     target.querySelectorAll('[data-run-task]').forEach(button => { button.onclick = async () => { button.disabled = true; button.textContent = '...'; try { const endpoint = button.dataset.action === 'upload' ? `/api/tasks/${button.dataset.runTask}/upload` : `/api/tasks/${button.dataset.runTask}/run`; await api(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) }); await refreshQueue(); } catch (error) { button.disabled = false; button.textContent = error.message; } }; });
   } catch (error) { target.innerHTML = `<div class="empty">${error.message}</div>`; }
 }
@@ -33,7 +34,19 @@ document.addEventListener('DOMContentLoaded', () => {
   enhanceUniqueizer();
   enhanceAnalytics();
   refreshAnalyticsData();
+  enhanceOperations();
 });
+
+function enhanceOperations() {
+  const settings = document.querySelector('#settings .card');
+  if (!settings || document.querySelector('#cf-ops')) return;
+  const panel = document.createElement('div'); panel.id = 'cf-ops'; panel.className = 'field';
+  panel.innerHTML = '<h2>Прокси и журнал</h2><p class="hint">Прокси хранятся локально; пароли не выводятся в списке.</p><textarea id="cf-proxy-input" class="input" rows="4" placeholder="host:port\nhost:port:login:password"></textarea><div class="row" style="margin-top:8px"><select id="cf-proxy-type" class="input"><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks5">SOCKS5</option></select><button id="cf-proxy-save" class="btn">Импортировать прокси</button></div><div id="cf-proxy-status" class="hint" style="margin-top:8px"></div><div id="cf-log-list" class="log" style="height:120px;margin-top:12px">Загрузка журнала...</div>';
+  settings.appendChild(panel);
+  panel.querySelector('#cf-proxy-save').onclick = async () => { const text = panel.querySelector('#cf-proxy-input').value; if (!text.trim()) return; try { const result = await api('/api/proxies/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, type: panel.querySelector('#cf-proxy-type').value }) }); panel.querySelector('#cf-proxy-input').value = ''; panel.querySelector('#cf-proxy-status').textContent = `Импортировано: ${result.imported}, ошибочных строк: ${result.invalid}`; } catch (error) { panel.querySelector('#cf-proxy-status').textContent = error.message; } };
+  const loadLogs = async () => { try { const result = await api('/api/logs'); panel.querySelector('#cf-log-list').innerHTML = result.logs.length ? result.logs.map(log => `<div><b>${escapeHtml(log.level)}</b> ${escapeHtml(log.message)}</div>`).join('') : 'Журнал пуст'; } catch (error) { panel.querySelector('#cf-log-list').textContent = error.message; } };
+  loadLogs(); setInterval(loadLogs, 5000);
+}
 
 function enhanceUniqueizer() {
   const card = document.querySelector('#editor .layout .card');
