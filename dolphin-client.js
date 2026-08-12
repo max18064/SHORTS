@@ -16,10 +16,10 @@ export function createDolphinClient({ baseUrl, token, automation = true }) {
     return data;
   }
   return {
-    listProfiles: () => request('/v1.0/browser_profiles?limit=100'),
-    startProfile: id => request(`/v1.0/browser_profiles/${encodeURIComponent(id)}/start${automation ? '?automation=1' : ''}`),
-    stopProfile: id => request(`/v1.0/browser_profiles/${encodeURIComponent(id)}/stop`),
-    profile: id => request(`/v1.0/browser_profiles/${encodeURIComponent(id)}`),
+    listProfiles: () => request('/browser_profiles?limit=100'),
+    startProfile: id => request(`/browser_profiles/${encodeURIComponent(id)}/start${automation ? '?automation=1' : ''}`),
+    stopProfile: id => request(`/browser_profiles/${encodeURIComponent(id)}/stop`),
+    profile: id => request(`/browser_profiles/${encodeURIComponent(id)}`),
     request
   };
 }

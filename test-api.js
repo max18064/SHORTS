@@ -10,6 +10,8 @@ const base = `http://127.0.0.1:${port}`;
 try {
   const health = await (await fetch(`${base}/api/health`)).json();
   assert.equal(typeof health.configured, 'boolean');
+  const profiles = await (await fetch(`${base}/api/profiles`)).json();
+  assert.ok(profiles.data || profiles.error);
   const tasks = await (await fetch(`${base}/api/tasks`)).json();
   assert.ok(Array.isArray(tasks.tasks));
   const proxies = await (await fetch(`${base}/api/proxies`)).json();
