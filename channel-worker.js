@@ -59,3 +59,21 @@ export async function updateChannelBranding({ wsEndpoint, name = '', description
     await browser.close();
   }
 }
+
+export async function inspectChannel({ wsEndpoint }) {
+  if (!wsEndpoint) throw new Error('Dolphin не вернул адрес автоматизации профиля');
+  const browser = await chromium.connectOverCDP(wsEndpoint);
+  try {
+    const context = browser.contexts()[0];
+    const page = context.pages()[0] || await context.newPage();
+    await page.goto('https://studio.youtube.com/', { waitUntil: 'domcontentloaded' });
+    if (loginUrl.test(page.url())) return { status: 'manual-login-required', url: page.url() };
+    await page.waitForTimeout(500);
+    const channelName = await page.locator('#channel-name, ytcp-channel-name, [id="channel-name"]').first().innerText().catch(() => '');
+    const avatarUrl = await page.locator('img#img, yt-img-shadow img').first().getAttribute('src').catch(() => '');
+    const title = await page.title();
+    return { status: 'connected', channelName: channelName.trim() || title.replace(/\s*[-—].*$/, ''), avatarUrl: avatarUrl || '', url: page.url() };
+  } finally {
+    await browser.close();
+  }
+}

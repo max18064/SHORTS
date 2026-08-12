@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { createDolphinClient } from './dolphin-client.js';
 import { openUploadSession, uploadIntoSession, uploadOwnVideo } from './upload-worker.js';
-import { updateChannelBranding } from './channel-worker.js';
+import { inspectChannel, updateChannelBranding } from './channel-worker.js';
 
 const app = express();
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -107,6 +107,26 @@ app.post('/api/profiles/:id/stop', async (req, res) => {
     const result = await localDolphin('stop', req.params.id);
     res.json(result);
   } catch (error) { res.status(502).json({ error: error.message }); }
+});
+
+app.post('/api/profiles/:id/youtube-status', async (req, res) => {
+  try {
+    let profileResult;
+    try { profileResult = await localDolphin('start', req.params.id, dolphinAutomation); }
+    catch (error) {
+      if (!/already running/i.test(error.message) || req.body?.restart !== true) throw error;
+      await localDolphin('stop', req.params.id);
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      profileResult = await localDolphin('start', req.params.id, dolphinAutomation);
+    }
+    const wsEndpoint = getAutomationEndpoint(profileResult);
+    const channel = wsEndpoint ? await inspectChannel({ wsEndpoint }) : { status: 'automation-unavailable' };
+    addLog(`Проверка YouTube-профиля ${req.params.id}: ${channel.status}`);
+    res.json({ profileId: req.params.id, channel });
+  } catch (error) {
+    if (/already running/i.test(error.message)) return res.status(409).json({ error: 'Профиль уже запущен вне Creator Flow. Для чтения данных нажмите «Перезапустить и считать»: Dolphin перезапустит только этот профиль с Automation API.', code: 'profile-already-running' });
+    res.status(422).json({ error: error.message });
+  }
 });
 
 app.get('/api/tasks', (_req, res) => res.json({ tasks }));
