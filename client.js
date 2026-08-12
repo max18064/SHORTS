@@ -9,7 +9,8 @@ async function refreshQueue() {
     const payload = await api('/api/tasks');
     const tasks = payload.tasks || [];
     if (!tasks.length) { target.innerHTML = '<div class="empty">Очередь пока пуста</div>'; return; }
-    target.innerHTML = tasks.map((task, index) => `<div class="task"><span class="num">${String(index + 1).padStart(2, '0')}</span><span><b>${task.title}</b><br><small>${task.status} · ${task.profileId}</small></span><span class="pill ${task.status === 'queued' ? 'wait' : ''}">${task.status}</span></div>`).join('');
+    target.innerHTML = tasks.map((task, index) => `<div class="task"><span class="num">${String(index + 1).padStart(2, '0')}</span><span><b>${task.title}</b><br><small>${task.status} · ${task.profileId}</small></span><span><span class="pill ${task.status === 'queued' ? 'wait' : ''}">${task.status}</span><br><button class="btn" data-run-task="${task.id}" data-action="run" style="padding:4px 7px;margin-top:5px">Профиль</button>${task.status === 'profile-ready' ? `<button class="btn green" data-run-task="${task.id}" data-action="upload" style="padding:4px 7px;margin-top:5px">Загрузить</button>` : ''}</span></div>`).join('');
+    target.querySelectorAll('[data-run-task]').forEach(button => { button.onclick = async () => { button.disabled = true; button.textContent = '...'; try { const endpoint = button.dataset.action === 'upload' ? `/api/tasks/${button.dataset.runTask}/upload` : `/api/tasks/${button.dataset.runTask}/run`; await api(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) }); await refreshQueue(); } catch (error) { button.disabled = false; button.textContent = error.message; } }; });
   } catch (error) { target.innerHTML = `<div class="empty">${error.message}</div>`; }
 }
 
