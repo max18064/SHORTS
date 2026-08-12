@@ -13,7 +13,8 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 const apiBase = process.env.DOLPHIN_API_BASE || 'https://anty-api.com';
 const localApi = process.env.DOLPHIN_LOCAL_API || 'http://localhost:3001';
 const token = process.env.DOLPHIN_API_TOKEN;
-const dolphinClient = createDolphinClient({ baseUrl: apiBase, token, automation: process.env.DOLPHIN_AUTOMATION !== '0' });
+const dolphinAutomation = process.env.DOLPHIN_AUTOMATION !== '0';
+const dolphinClient = createDolphinClient({ baseUrl: apiBase, token, automation: dolphinAutomation });
 const tasks = [];
 const proxies = [];
 const videos = [];
@@ -32,13 +33,21 @@ function getAutomationEndpoint(result) {
   if (payload.selenium_port) return `http://127.0.0.1:${payload.selenium_port}`;
   return null;
 }
+async function localDolphin(action, id, automation = false) {
+  const query = automation ? '?automation=1' : '';
+  const response = await fetch(`${localApi}/v1.0/browser_profiles/${encodeURIComponent(id)}/${action}${query}`);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.success === false) throw new Error(data.error || `Локальный Dolphin API: ${response.status}`);
+  return data;
+}
 async function startQueuedTask(task) {
   if (task.status !== 'queued') return task;
   task.status = 'starting-profile'; task.updatedAt = new Date().toISOString(); addLog(`Запуск запланированной задачи для профиля ${task.profileId}`, task.id);
   try {
-    task.profileResult = await dolphinClient.startProfile(task.profileId);
+    task.profileResult = await localDolphin('start', task.profileId, dolphinAutomation);
     task.wsEndpoint = getAutomationEndpoint(task.profileResult);
-    task.status = 'profile-ready'; task.message = 'Профиль запущен. Готов к браузерному этапу публикации.';
+    task.status = task.wsEndpoint ? 'profile-ready' : 'manual-login-required';
+    task.message = task.wsEndpoint ? 'Профиль запущен. Готов к браузерному этапу публикации.' : 'Профиль запущен. Выполните ручной вход; для браузерного этапа нужен тариф Dolphin с Automation API.';
     addLog(`Профиль запущен${task.wsEndpoint ? ', адрес браузера получен' : ', адрес браузера не найден в ответе API'}`, task.id, task.wsEndpoint ? 'info' : 'warn');
   } catch (error) { task.status = 'error'; task.error = error.message; addLog(`Ошибка запуска профиля: ${error.message}`, task.id, 'error'); }
   task.updatedAt = new Date().toISOString(); saveState(); return task;
@@ -83,14 +92,14 @@ app.get('/api/profiles', async (_req, res) => {
 
 app.post('/api/profiles/:id/start', async (req, res) => {
   try {
-    const result = await dolphinClient.startProfile(req.params.id);
+    const result = await localDolphin('start', req.params.id, dolphinAutomation);
     res.json(result);
   } catch (error) { res.status(502).json({ error: error.message }); }
 });
 
 app.post('/api/profiles/:id/stop', async (req, res) => {
   try {
-    const result = await dolphinClient.stopProfile(req.params.id);
+    const result = await localDolphin('stop', req.params.id);
     res.json(result);
   } catch (error) { res.status(502).json({ error: error.message }); }
 });
