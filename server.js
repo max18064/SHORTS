@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { createDolphinClient } from './dolphin-client.js';
 import { openUploadSession, uploadIntoSession, uploadOwnVideo } from './upload-worker.js';
+import { updateChannelBranding } from './channel-worker.js';
 
 const app = express();
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -18,13 +19,14 @@ const dolphinClient = createDolphinClient({ baseUrl: apiBase, token, automation:
 const tasks = [];
 const proxies = [];
 const videos = [];
+const channelTasks = [];
 const logs = [];
 const uploadSessions = new Map();
 const execFileAsync = promisify(execFile);
 const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
 const statePath = process.env.CREATOR_FLOW_STATE_PATH || path.join(root, '.creator-flow-state.json');
-try { const saved = JSON.parse(fs.readFileSync(statePath, 'utf8')); tasks.push(...(saved.tasks || [])); proxies.push(...(saved.proxies || [])); videos.push(...(saved.videos || [])); } catch {}
-function saveState() { fs.writeFileSync(statePath, JSON.stringify({ tasks, proxies, videos }, null, 2)); }
+try { const saved = JSON.parse(fs.readFileSync(statePath, 'utf8')); tasks.push(...(saved.tasks || [])); proxies.push(...(saved.proxies || [])); videos.push(...(saved.videos || [])); channelTasks.push(...(saved.channelTasks || [])); } catch {}
+function saveState() { fs.writeFileSync(statePath, JSON.stringify({ tasks, proxies, videos, channelTasks }, null, 2)); }
 function addLog(message, taskId = null, level = 'info') { logs.unshift({ id: crypto.randomUUID(), timestamp: new Date().toISOString(), taskId, level, message }); if (logs.length > 500) logs.pop(); }
 function getAutomationEndpoint(result) {
   const payload = result?.data || result || {};
@@ -110,6 +112,7 @@ app.post('/api/profiles/:id/stop', async (req, res) => {
 app.get('/api/tasks', (_req, res) => res.json({ tasks }));
 app.get('/api/logs', (_req, res) => res.json({ logs: logs.slice(0, 200) }));
 app.get('/api/videos', (_req, res) => res.json({ videos }));
+app.get('/api/channels/tasks', (_req, res) => res.json({ tasks: channelTasks }));
 app.get('/api/videos/stats', (_req, res) => {
   const stats = videos.reduce((acc, video) => ({ count: acc.count + 1, views: acc.views + Number(video.views || 0), likes: acc.likes + Number(video.likes || 0), comments: acc.comments + Number(video.comments || 0), zeroViews: acc.zeroViews + (Number(video.views || 0) === 0 ? 1 : 0), over300: acc.over300 + (Number(video.views || 0) >= 300 ? 1 : 0), unavailable: acc.unavailable + (video.status === 'unavailable' ? 1 : 0) }), { count: 0, views: 0, likes: 0, comments: 0, zeroViews: 0, over300: 0, unavailable: 0 });
   res.json(stats);
@@ -200,6 +203,34 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
   task.status = 'cancelled'; task.updatedAt = new Date().toISOString();
   saveState();
   res.json(task);
+});
+
+app.post('/api/channels/tasks', (req, res) => {
+  const { profileId, name = '', description = '', links = [], avatarPath = '', bannerPath = '' } = req.body || {};
+  if (!profileId) return res.status(400).json({ error: 'profileId обязателен' });
+  const safeLinks = Array.isArray(links) ? links.filter(link => link && typeof link.title === 'string' && typeof link.url === 'string') : [];
+  if (!name && !description && !safeLinks.length && !avatarPath && !bannerPath) return res.status(400).json({ error: 'Укажите хотя бы одно изменение оформления канала' });
+  const task = { id: crypto.randomUUID(), profileId, name, description, links: safeLinks, avatarPath, bannerPath, status: 'queued', createdAt: new Date().toISOString() };
+  channelTasks.unshift(task); saveState(); addLog(`Задача оформления канала создана для профиля ${profileId}`, task.id); res.status(201).json(task);
+});
+
+app.post('/api/channels/tasks/:id/run', async (req, res) => {
+  const task = channelTasks.find(item => item.id === req.params.id);
+  if (!task) return res.status(404).json({ error: 'Задача оформления канала не найдена' });
+  task.status = 'starting-profile'; task.updatedAt = new Date().toISOString(); saveState();
+  try {
+    const profileResult = await localDolphin('start', task.profileId, dolphinAutomation);
+    const wsEndpoint = getAutomationEndpoint(profileResult);
+    if (!wsEndpoint) { task.status = 'manual-login-required'; task.message = 'Профиль открыт. Выполните ручной вход в YouTube, затем запустите задачу повторно.'; }
+    else {
+      task.status = 'applying'; saveState();
+      task.result = await updateChannelBranding({ wsEndpoint, name: task.name, description: task.description, links: task.links, avatarPath: task.avatarPath, bannerPath: task.bannerPath });
+      task.status = task.result.status === 'manual-login-required' ? 'manual-login-required' : 'completed';
+      task.message = task.status === 'completed' ? 'Оформление канала обновлено.' : 'Выполните ручной вход в YouTube в открытом профиле и повторите запуск.';
+    }
+    addLog(`Оформление канала: ${task.status}`, task.id, task.status === 'completed' ? 'info' : 'warn');
+  } catch (error) { task.status = 'error'; task.error = error.message; addLog(`Ошибка оформления канала: ${error.message}`, task.id, 'error'); }
+  task.updatedAt = new Date().toISOString(); saveState(); res.json(task);
 });
 
 app.get('/api/uniqueizer/health', async (_req, res) => {

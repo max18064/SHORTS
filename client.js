@@ -35,7 +35,26 @@ document.addEventListener('DOMContentLoaded', () => {
   enhanceAnalytics();
   refreshAnalyticsData();
   enhanceOperations();
+  enhanceChannelManager();
 });
+
+function enhanceChannelManager() {
+  if (document.querySelector('#channels')) return;
+  const nav = document.querySelector('.nav[data-page="editor"]');
+  const page = document.createElement('section');
+  page.className = 'page'; page.id = 'channels';
+  page.innerHTML = '<div class="layout"><div class="card"><h2>Оформление YouTube-канала</h2><p class="hint">Выберите профиль Dolphin с уже выполненным ручным входом.</p><div id="cf-channel-panel"></div></div><div class="card"><h2>Задачи оформления</h2><div class="queue" id="cf-channel-tasks"></div></div></div>';
+  document.querySelector('main').appendChild(page);
+  const button = document.createElement('button'); button.className = 'nav'; button.dataset.page = 'channels'; button.innerHTML = '<i>◉</i>Каналы'; nav.before(button);
+  button.onclick = () => { document.querySelectorAll('.nav').forEach(item => item.classList.remove('active')); button.classList.add('active'); document.querySelectorAll('.page').forEach(item => item.classList.remove('active')); page.classList.add('active'); document.querySelector('#title').textContent = 'Каналы'; };
+  const panel = page.querySelector('#cf-channel-panel');
+  panel.innerHTML = '<div class="field"><label>Профиль Dolphin</label><select class="input" id="cf-channel-profile"><option>Загрузка профилей…</option></select></div><div class="field"><label>Название канала</label><input class="input" id="cf-channel-name" placeholder="Название"></div><div class="field"><label>Описание</label><textarea class="input" id="cf-channel-description" rows="3" placeholder="Описание канала"></textarea></div><div class="formgrid"><div class="field"><label>Аватар (полный путь)</label><input class="input" id="cf-channel-avatar" placeholder="C:\\Images\\avatar.png"></div><div class="field"><label>Баннер (полный путь)</label><input class="input" id="cf-channel-banner" placeholder="C:\\Images\\banner.png"></div></div><div class="field"><label>Ссылки: название | URL, по одной в строке</label><textarea class="input" id="cf-channel-links" rows="3" placeholder="Telegram | https://t.me/example"></textarea></div><button class="btn green" id="cf-channel-create">Создать задачу оформления</button><small id="cf-channel-message" style="display:block;margin-top:8px"></small>';
+  const profileSelect = panel.querySelector('#cf-channel-profile');
+  const loadProfiles = async () => { try { const data = await api('/api/profiles'); const profiles = data.data || data.profiles || data.items || []; profileSelect.innerHTML = profiles.length ? profiles.map(profile => `<option value="${escapeHtml(profile.id || profile.uuid)}">${escapeHtml(profile.name || profile.title || profile.id || profile.uuid)}</option>`).join('') : '<option value="">Профили не найдены</option>'; } catch (error) { profileSelect.innerHTML = '<option value="">Dolphin недоступен</option>'; } };
+  const refreshTasks = async () => { const target = page.querySelector('#cf-channel-tasks'); try { const data = await api('/api/channels/tasks'); const tasks = data.tasks || []; target.innerHTML = tasks.length ? tasks.map(task => `<div class="task"><span class="num">◉</span><span><b>${escapeHtml(task.name || 'Оформление канала')}</b><br><small>${escapeHtml(task.profileId)} · ${escapeHtml(task.status)}</small></span><button class="btn ${task.status === 'completed' ? '' : 'green'}" data-channel-run="${escapeHtml(task.id)}" ${task.status === 'completed' ? 'disabled' : ''}>${task.status === 'completed' ? 'Готово' : 'Применить'}</button></div>`).join('') : '<div class="empty">Задач оформления пока нет</div>'; target.querySelectorAll('[data-channel-run]').forEach(item => item.onclick = async () => { item.disabled = true; item.textContent = '…'; try { await api(`/api/channels/tasks/${item.dataset.channelRun}/run`, { method: 'POST' }); await refreshTasks(); } catch (error) { item.textContent = error.message; } }); } catch (error) { target.textContent = error.message; } };
+  panel.querySelector('#cf-channel-create').onclick = async () => { const rawLinks = panel.querySelector('#cf-channel-links').value.split(/\r?\n/).map(line => line.split('|').map(value => value.trim())).filter(parts => parts[0] && parts[1]).map(([title, url]) => ({ title, url })); const body = { profileId: profileSelect.value, name: panel.querySelector('#cf-channel-name').value.trim(), description: panel.querySelector('#cf-channel-description').value.trim(), avatarPath: panel.querySelector('#cf-channel-avatar').value.trim(), bannerPath: panel.querySelector('#cf-channel-banner').value.trim(), links: rawLinks }; try { await api('/api/channels/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); panel.querySelector('#cf-channel-message').textContent = 'Задача добавлена. Нажмите «Применить», чтобы изменить выбранный канал.'; await refreshTasks(); } catch (error) { panel.querySelector('#cf-channel-message').textContent = error.message; } };
+  loadProfiles(); refreshTasks();
+}
 
 function enhanceOperations() {
   const settings = document.querySelector('#settings .card');

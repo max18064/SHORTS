@@ -25,6 +25,10 @@ try {
   assert.equal(createdVideo.status, 'published');
   const stats = await (await fetch(`${base}/api/videos/stats`)).json();
   assert.ok(stats.count >= 1 && stats.over300 >= 1);
+  const channelTask = await (await fetch(`${base}/api/channels/tasks`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ profileId: 'test-profile', name: 'Test channel', description: 'Test description', links: [{ title: 'Site', url: 'https://example.com' }] }) })).json();
+  assert.equal(channelTask.status, 'queued');
+  const channelTasks = await (await fetch(`${base}/api/channels/tasks`)).json();
+  assert.equal(channelTasks.tasks.length, 1);
   const uniqueizer = await (await fetch(`${base}/api/uniqueizer/health`)).json();
   assert.equal(typeof uniqueizer.available, 'boolean');
   if (uniqueizer.available) {
