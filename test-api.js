@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 process.env.PORT = '0';
+process.env.CREATOR_FLOW_STATE_PATH = path.join(process.cwd(), '.test-state.json');
+try { fs.unlinkSync(process.env.CREATOR_FLOW_STATE_PATH); } catch {}
 const { server } = await import('./server.js');
 const port = server.address().port;
 const base = `http://127.0.0.1:${port}`;
@@ -19,4 +23,4 @@ try {
   const uniqueizer = await (await fetch(`${base}/api/uniqueizer/health`)).json();
   assert.equal(typeof uniqueizer.available, 'boolean');
   console.log('API smoke test passed');
-} finally { server.close(); }
+} finally { server.close(); try { fs.unlinkSync(process.env.CREATOR_FLOW_STATE_PATH); } catch {} }

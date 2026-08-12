@@ -21,7 +21,7 @@ const logs = [];
 const uploadSessions = new Map();
 const execFileAsync = promisify(execFile);
 const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
-const statePath = path.join(root, '.creator-flow-state.json');
+const statePath = process.env.CREATOR_FLOW_STATE_PATH || path.join(root, '.creator-flow-state.json');
 try { const saved = JSON.parse(fs.readFileSync(statePath, 'utf8')); tasks.push(...(saved.tasks || [])); proxies.push(...(saved.proxies || [])); videos.push(...(saved.videos || [])); } catch {}
 function saveState() { fs.writeFileSync(statePath, JSON.stringify({ tasks, proxies, videos }, null, 2)); }
 function addLog(message, taskId = null, level = 'info') { logs.unshift({ id: crypto.randomUUID(), timestamp: new Date().toISOString(), taskId, level, message }); if (logs.length > 500) logs.pop(); }

@@ -3,3 +3,4 @@
 node_modules/
 dist/
 .creator-flow-state.json
+.test-state.json
