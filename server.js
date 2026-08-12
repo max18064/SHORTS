@@ -20,6 +20,7 @@ const videos = [];
 const logs = [];
 const uploadSessions = new Map();
 const execFileAsync = promisify(execFile);
+const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
 const statePath = path.join(root, '.creator-flow-state.json');
 try { const saved = JSON.parse(fs.readFileSync(statePath, 'utf8')); tasks.push(...(saved.tasks || [])); proxies.push(...(saved.proxies || [])); videos.push(...(saved.videos || [])); } catch {}
 function saveState() { fs.writeFileSync(statePath, JSON.stringify({ tasks, proxies, videos }, null, 2)); }
@@ -141,7 +142,7 @@ app.post('/api/tasks/:id/upload', async (req, res) => {
   task.status = 'uploading'; task.updatedAt = new Date().toISOString(); addLog('Начата загрузка ролика в браузере профиля', task.id);
   try {
     task.uploadResult = await uploadOwnVideo({ wsEndpoint, videoPath: task.videoPath, title: task.title, description: task.description, tags: task.tags });
-    task.status = 'awaiting-review';
+    task.status = task.uploadResult.status === 'manual-login-required' ? 'manual-login-required' : 'awaiting-review';
     addLog('Видео загружено в форму и ожидает ручной проверки', task.id);
   } catch (error) { task.status = 'error'; task.error = error.message; addLog(`Ошибка загрузки: ${error.message}`, task.id, 'error'); }
   task.updatedAt = new Date().toISOString();
@@ -188,7 +189,7 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
 });
 
 app.get('/api/uniqueizer/health', async (_req, res) => {
-  try { const result = await execFileAsync('ffmpeg', ['-version']); res.json({ available: true, version: result.stdout.split('\n')[0] }); }
+  try { const result = await execFileAsync(ffmpegBin, ['-version']); res.json({ available: true, path: ffmpegBin, version: result.stdout.split('\n')[0] }); }
   catch { res.json({ available: false, message: 'FFmpeg не найден. Установите FFmpeg и добавьте его в PATH.' }); }
 });
 
@@ -198,7 +199,7 @@ app.post('/api/uniqueizer/render', async (req, res) => {
   const args = ['-y', '-i', inputPath];
   if (overlayPath) args.push('-i', overlayPath, '-filter_complex', '[0:v][1:v]overlay=0:0:format=auto');
   args.push('-map_metadata', '-1', '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-c:a', 'aac', outputPath);
-  try { await execFileAsync('ffmpeg', args, { windowsHide: true }); res.status(201).json({ status: 'completed', outputPath }); }
+  try { await execFileAsync(ffmpegBin, args, { windowsHide: true }); res.status(201).json({ status: 'completed', outputPath }); }
   catch (error) { res.status(422).json({ status: 'error', error: error.message, hint: 'Установите FFmpeg и проверьте пути к файлам.' }); }
 });
 
