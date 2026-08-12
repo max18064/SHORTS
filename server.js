@@ -66,10 +66,12 @@ async function dolphin(pathname, options = {}) {
 }
 
 app.get('/api/health', async (_req, res) => {
+  let remoteApi = false;
+  if (token) { try { await dolphinClient.listProfiles(); remoteApi = true; } catch {} }
   try {
     const response = await fetch(localApi, { signal: AbortSignal.timeout(2000) });
-    res.json({ configured: Boolean(token), localApi, localRunning: response.ok });
-  } catch { res.json({ configured: Boolean(token), localApi, localRunning: false }); }
+    res.json({ configured: Boolean(token), remoteApi, localApi, localRunning: response.ok });
+  } catch { res.json({ configured: Boolean(token), remoteApi, localApi, localRunning: false }); }
 });
 
 app.get('/api/profiles', async (_req, res) => {
