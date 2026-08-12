@@ -26,5 +26,8 @@
 - `POST /api/tasks/:id/cancel` — отменить задачу.
 - `GET /api/proxies` — список добавленных прокси без отображения паролей;
 - `POST /api/proxies/import` — импорт текстового списка прокси.
+- `GET /api/videos` и `GET /api/videos/stats` — реестр опубликованных роликов и агрегаты;
+- `POST /api/videos` — добавить публикацию в реестр;
+- `PATCH /api/videos/:id/stats` — обновить статистику и статус доступности.
 - `GET /api/uniqueizer/health` — проверка доступности FFmpeg для обработки видео.
 - `POST /api/uniqueizer/render` — обработка собственного ролика с опциональным PNG-оверлеем.

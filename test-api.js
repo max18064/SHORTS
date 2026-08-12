@@ -12,6 +12,10 @@ try {
   assert.ok(Array.isArray(proxies.proxies));
   const importResult = await (await fetch(`${base}/api/proxies/import`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'http', text: '# test\n127.0.0.1:8080\ninvalid' }) })).json();
   assert.equal(importResult.imported, 1);
+  const createdVideo = await (await fetch(`${base}/api/videos`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Smoke test', videoPath: 'C:/test.mp4', profileId: 'test-profile', views: 301 }) })).json();
+  assert.equal(createdVideo.status, 'published');
+  const stats = await (await fetch(`${base}/api/videos/stats`)).json();
+  assert.ok(stats.count >= 1 && stats.over300 >= 1);
   const uniqueizer = await (await fetch(`${base}/api/uniqueizer/health`)).json();
   assert.equal(typeof uniqueizer.available, 'boolean');
   console.log('API smoke test passed');

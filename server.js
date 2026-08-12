@@ -16,11 +16,12 @@ const token = process.env.DOLPHIN_API_TOKEN;
 const dolphinClient = createDolphinClient({ baseUrl: apiBase, token });
 const tasks = [];
 const proxies = [];
+const videos = [];
 const logs = [];
 const execFileAsync = promisify(execFile);
 const statePath = path.join(root, '.creator-flow-state.json');
-try { const saved = JSON.parse(fs.readFileSync(statePath, 'utf8')); tasks.push(...(saved.tasks || [])); proxies.push(...(saved.proxies || [])); } catch {}
-function saveState() { fs.writeFileSync(statePath, JSON.stringify({ tasks, proxies }, null, 2)); }
+try { const saved = JSON.parse(fs.readFileSync(statePath, 'utf8')); tasks.push(...(saved.tasks || [])); proxies.push(...(saved.proxies || [])); videos.push(...(saved.videos || [])); } catch {}
+function saveState() { fs.writeFileSync(statePath, JSON.stringify({ tasks, proxies, videos }, null, 2)); }
 function addLog(message, taskId = null, level = 'info') { logs.unshift({ id: crypto.randomUUID(), timestamp: new Date().toISOString(), taskId, level, message }); if (logs.length > 500) logs.pop(); }
 
 app.use(express.json());
@@ -68,6 +69,24 @@ app.post('/api/profiles/:id/stop', async (req, res) => {
 
 app.get('/api/tasks', (_req, res) => res.json({ tasks }));
 app.get('/api/logs', (_req, res) => res.json({ logs: logs.slice(0, 200) }));
+app.get('/api/videos', (_req, res) => res.json({ videos }));
+app.get('/api/videos/stats', (_req, res) => {
+  const stats = videos.reduce((acc, video) => ({ count: acc.count + 1, views: acc.views + Number(video.views || 0), likes: acc.likes + Number(video.likes || 0), comments: acc.comments + Number(video.comments || 0), zeroViews: acc.zeroViews + (Number(video.views || 0) === 0 ? 1 : 0), over300: acc.over300 + (Number(video.views || 0) >= 300 ? 1 : 0), unavailable: acc.unavailable + (video.status === 'unavailable' ? 1 : 0) }), { count: 0, views: 0, likes: 0, comments: 0, zeroViews: 0, over300: 0, unavailable: 0 });
+  res.json(stats);
+});
+app.post('/api/videos', (req, res) => {
+  const { title, videoPath, profileId, publishedAt = null, views = 0, likes = 0, comments = 0 } = req.body || {};
+  if (!title || !videoPath || !profileId) return res.status(400).json({ error: 'title, videoPath и profileId обязательны' });
+  const video = { id: crypto.randomUUID(), title, videoPath, profileId, publishedAt, views: Number(views), likes: Number(likes), comments: Number(comments), status: 'published', createdAt: new Date().toISOString() };
+  videos.push(video); saveState(); addLog(`Видео добавлено в реестр: ${title}`); res.status(201).json(video);
+});
+app.patch('/api/videos/:id/stats', (req, res) => {
+  const video = videos.find(item => item.id === req.params.id);
+  if (!video) return res.status(404).json({ error: 'Видео не найдено' });
+  for (const key of ['views', 'likes', 'comments']) if (req.body?.[key] !== undefined) video[key] = Math.max(0, Number(req.body[key]) || 0);
+  if (req.body?.status) video.status = String(req.body.status);
+  video.updatedAt = new Date().toISOString(); saveState(); res.json(video);
+});
 
 app.get('/api/proxies', (_req, res) => res.json({ proxies: proxies.map(({ password, ...safe }) => safe) }));
 

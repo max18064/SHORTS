@@ -31,6 +31,7 @@ document.addEventListener('DOMContentLoaded', () => {
   refreshQueue();
   enhanceUniqueizer();
   enhanceAnalytics();
+  refreshAnalyticsData();
 });
 
 function enhanceUniqueizer() {
@@ -49,4 +50,12 @@ function enhanceAnalytics() {
   const card = document.createElement('div'); card.id = 'cf-analytics-extra'; card.className = 'card'; card.style.marginTop = '18px';
   card.innerHTML = '<h2>Детализация выборки</h2><div class="stats" style="margin-top:14px"><div class="stat"><b>55</b><span>нулевых просмотров</span></div><div class="stat"><b style="color:var(--green)">40</b><span>300+ просмотров</span></div><div class="stat"><b style="color:var(--red)">83</b><span>недоступных</span></div><div class="stat"><b>0</b><span>с пометкой 18+</span></div></div><div class="row" style="margin-top:16px"><button class="btn green">Обновить статистику</button><button class="btn danger">Удалить недоступные</button></div>';
   page.appendChild(card);
+}
+
+async function refreshAnalyticsData() {
+  try {
+    const stats = await api('/api/videos/stats');
+    const values = document.querySelectorAll('#analytics .stats .metric b');
+    [stats.count, stats.views, stats.likes, stats.comments].forEach((value, index) => { if (values[index]) values[index].textContent = Number(value || 0).toLocaleString('ru-RU'); });
+  } catch {}
 }
