@@ -1,7 +1,7 @@
 const state = {
   health: null, profiles: [], tasks: [], library: [], channelTasks: [], logs: [], proxies: [],
   settings: null, worker: null, accountStates: new Map(), analytics: new Map(), studioBatches: [], accountBatches: [],
-  bulkProfileIds: new Set(), channelBulkProfileIds: new Set(), folders: [],
+  bulkProfileIds: new Set(), channelBulkProfileIds: new Set(), folders: [], processingBatches: [], processingProcessor: null,
 };
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
@@ -107,7 +107,7 @@ function taskStatusLabel(status) {
   const labels = {
     queued: 'в очереди', scheduled: 'запланирована', starting: 'подготовка профиля', 'starting-profile': 'подготовка профиля', applying: 'применение изменений', 'profile-ready': 'готова к загрузке',
     uploading: 'загрузка в Studio', 'manual-login-required': 'нужен вход', 'login-ready': 'вход подтверждён',
-    'awaiting-review': 'на проверке', completed: 'выполнена', cancelled: 'отменена', error: 'ошибка', 'recovery-needed': 'требует проверки',
+    'awaiting-review': 'на проверке', running: 'обрабатывается', completed: 'выполнена', cancelled: 'отменена', error: 'ошибка', 'recovery-needed': 'требует проверки', 'needs-attention': 'требует проверки', 'completed-with-errors': 'есть ошибки',
   };
   return labels[status] || status || 'неизвестно';
 }
@@ -125,6 +125,7 @@ function activatePage(id) {
   $('#page-title').textContent = pageNames[id] || 'Creator Flow';
   if (id === 'accounts') Promise.all([loadAccounts(), loadAccountBatches()]).catch(() => renderAccounts());
   if (id === 'analytics') Promise.all([refreshAnalyticsView(), loadStudioBatches()]).catch(() => {});
+  if (id === 'processing') Promise.all([loadProcessingBatches(), loadLibrary()]).catch(() => {});
   if (id === 'settings') refreshSettings().catch(() => {});
 }
 
@@ -143,6 +144,20 @@ function fillLibrarySelect(select, includeBlank = true) {
   const blank = includeBlank ? '<option value="">Выберите файл</option>' : '';
   select.innerHTML = blank + state.library.map(item => `<option value="${escapeHtml(item.filePath)}" data-title="${escapeHtml(item.fileName)}">${escapeHtml(item.fileName)} · ${formatDuration(item.durationSeconds)}</option>`).join('');
   if ([...select.options].some(option => option.value === previous)) select.value = previous;
+}
+
+function renderProcessingInputPicker() {
+  const select = $('#processing-batch-inputs');
+  const counter = $('#processing-batch-count');
+  if (!select || !counter) return;
+  const selected = new Set([...select.selectedOptions].map(option => option.value));
+  select.innerHTML = state.library
+    .filter(item => item.hasVideo !== false)
+    .map(item => `<option value="${escapeHtml(item.filePath)}" ${selected.has(item.filePath) ? 'selected' : ''}>${escapeHtml(item.fileName)} · ${formatDuration(item.durationSeconds)}</option>`)
+    .join('');
+  const selectedCount = [...select.selectedOptions].length;
+  counter.textContent = `Выбрано: ${selectedCount}`;
+  select.onchange = () => { counter.textContent = `Выбрано: ${[...select.selectedOptions].length}`; };
 }
 
 async function loadHealth() {
@@ -217,6 +232,7 @@ async function loadLibrary() {
   const response = await api('/api/library');
   state.library = response.library || [];
   fillLibrarySelect($('#task-library')); fillLibrarySelect($('#render-source'), false);
+  renderProcessingInputPicker();
   $('#metric-library').textContent = formatNumber(state.library.length);
   renderLibrary(); renderWorkspaceStatus();
 }
@@ -225,6 +241,13 @@ async function loadChannelTasks() {
   const response = await api('/api/channels/tasks');
   state.channelTasks = response.tasks || [];
   renderChannelTasks();
+}
+
+async function loadProcessingBatches() {
+  const response = await api('/api/processing/batches');
+  state.processingBatches = response.batches || [];
+  state.processingProcessor = response.processor || null;
+  renderProcessingBatches();
 }
 
 async function loadLogs() {
@@ -274,7 +297,7 @@ async function refreshAll() {
   $('#refresh-all').disabled = true;
   try {
     await loadHealth();
-    await Promise.all([loadProfiles(), loadAccounts(), loadTasks(), loadLibrary(), loadChannelTasks(), loadLogs(), loadProxies(), loadFfmpeg(), loadWorkerSettings(), loadStudioBatches(), loadAccountBatches(), loadFolders()]);
+    await Promise.all([loadProfiles(), loadAccounts(), loadTasks(), loadLibrary(), loadChannelTasks(), loadProcessingBatches(), loadLogs(), loadProxies(), loadFfmpeg(), loadWorkerSettings(), loadStudioBatches(), loadAccountBatches(), loadFolders()]);
     await refreshAnalyticsView();
   } catch (error) {
     const notice = $('#connection-notice'); notice.className = 'notice error'; notice.textContent = error.message;
@@ -286,7 +309,7 @@ async function refreshLiveState() {
   if (liveRefreshRunning) return;
   liveRefreshRunning = true;
   try {
-    await Promise.all([loadTasks(), loadLogs(), loadWorkerSettings(), loadStudioBatches(), loadAccounts(), loadAccountBatches()]);
+    await Promise.all([loadTasks(), loadLogs(), loadWorkerSettings(), loadStudioBatches(), loadAccounts(), loadAccountBatches(), loadProcessingBatches(), loadLibrary()]);
     if ($('#analytics').classList.contains('active')) await refreshAnalyticsView();
   } catch {
     // The main refresh action keeps connection errors visible; background refresh stays quiet.
@@ -861,6 +884,7 @@ function bindEvents() {
   $('#channel-bulk-select-all').onclick = () => setAllChannelBulkProfiles(true);
   $('#channel-bulk-select-none').onclick = () => setAllChannelBulkProfiles(false);
   $('#render-form').onsubmit = renderVideo;
+  $('#processing-batch-form').onsubmit = createProcessingBatch;
   $('#analytics-profile').onchange = refreshAnalyticsView;
   $('#analytics-sync').onclick = () => syncAnalytics(false);
   $('#analytics-sync-all').onclick = syncAllAnalytics;
@@ -970,6 +994,145 @@ async function renderVideo(event) {
   setMessage('#render-message', 'Запущена локальная обработка…');
   try { const response = await api('/api/uniqueizer/render', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ inputPath: source, outputPath, overlayPath }) }); setMessage('#render-message', `Готово: ${response.outputPath}`); await Promise.all([loadLibrary(), loadLogs()]); }
   catch (error) { setMessage('#render-message', error.message, 'error'); }
+}
+
+function processingBatchSummary(batch) {
+  const items = batch.items || [];
+  return {
+    total: Number(batch.total ?? items.length),
+    queued: Number(batch.queued ?? items.filter(item => item.status === 'queued').length),
+    running: Number(batch.running ?? items.filter(item => item.status === 'running').length),
+    completed: Number(batch.completed ?? items.filter(item => item.status === 'completed').length),
+    failed: Number(batch.failed ?? items.filter(item => item.status === 'error').length),
+    recoveryNeeded: Number(batch.recoveryNeeded ?? items.filter(item => item.status === 'recovery-needed').length),
+  };
+}
+
+function processingFileName(item) {
+  const raw = String(item?.fileName || item?.filePath || 'ролик');
+  return raw.replace(/^.*[\\/]/, '').replace(/\.[^.]+$/, '') || 'ролик';
+}
+
+function joinProcessingOutput(folder, fileName) {
+  const trimmedFolder = String(folder || '').trim().replace(/[\\/]+$/, '');
+  const separator = trimmedFolder.includes('\\') ? '\\' : '/';
+  return `${trimmedFolder}${separator}${fileName}`;
+}
+
+function renderProcessingBatches() {
+  const target = $('#processing-batches');
+  if (!target) return;
+  const processor = state.processingProcessor || { active: 0, limit: 3 };
+  if (!state.processingBatches.length) {
+    target.innerHTML = `<div class="empty">Пакетов пока нет. Локальный лимит: ${escapeHtml(String(processor.limit || 3))} FFmpeg-потока.</div>`;
+    return;
+  }
+  target.innerHTML = state.processingBatches.slice(0, 12).map(batch => {
+    const summary = processingBatchSummary(batch);
+    const launchButton = summary.queued && batch.autoRun === false
+      ? `<button class="btn" data-processing-run="${escapeHtml(batch.id)}">Запустить</button>`
+      : '';
+    const retryButton = (summary.failed || summary.recoveryNeeded)
+      ? `<button class="btn warning" data-processing-retry-batch="${escapeHtml(batch.id)}">Повторить ошибки</button>`
+      : '';
+    const items = (batch.items || []).map(item => {
+      const retry = ['error', 'recovery-needed'].includes(item.status)
+        ? `<button class="btn warning" data-processing-retry-item="${escapeHtml(batch.id)}" data-processing-item="${escapeHtml(item.id)}">Повторить</button>`
+        : '';
+      const details = item.error || item.message || '';
+      return `<div class="list-row"><div><b>${escapeHtml(processingFileName({ filePath: item.inputPath }))}</b><div class="meta">${escapeHtml(taskStatusLabel(item.status))}${details ? ` · ${escapeHtml(details)}` : ''}</div><span class="processing-output">→ ${escapeHtml(item.outputPath)}</span></div><div class="right"><span class="pill ${item.status === 'error' ? 'error' : ['queued', 'recovery-needed'].includes(item.status) ? 'wait' : ''}">${escapeHtml(taskStatusLabel(item.status))}</span>${retry ? `<div style="margin-top:7px">${retry}</div>` : ''}</div></div>`;
+    }).join('');
+    return `<div class="card" style="padding:14px"><div class="card-head"><div><h2>Пакет ${escapeHtml(String(batch.id).slice(0, 8))}</h2><p class="hint">${formatDate(batch.createdAt)} · ${batch.autoRun ? 'автозапуск включён' : 'ожидает ручного запуска'} · до ${escapeHtml(String(batch.concurrency || 1))} FFmpeg-потоков</p></div><div class="actions">${launchButton}${retryButton}</div></div><div class="processing-summary"><span><b>${summary.completed}</b> готово</span><span><b>${summary.running}</b> в работе</span><span><b>${summary.queued}</b> в очереди</span>${summary.failed ? `<span><b>${summary.failed}</b> ошибок</span>` : ''}${summary.recoveryNeeded ? `<span><b>${summary.recoveryNeeded}</b> требуют проверки</span>` : ''}</div><div class="list">${items}</div></div>`;
+  }).join('');
+  target.querySelectorAll('[data-processing-run]').forEach(button => {
+    button.onclick = () => runProcessingBatch(button.dataset.processingRun, false, button);
+  });
+  target.querySelectorAll('[data-processing-retry-batch]').forEach(button => {
+    button.onclick = () => runProcessingBatch(button.dataset.processingRetryBatch, true, button);
+  });
+  target.querySelectorAll('[data-processing-retry-item]').forEach(button => {
+    button.onclick = () => retryProcessingItem(button.dataset.processingRetryItem, button.dataset.processingItem, button);
+  });
+}
+
+async function runProcessingBatch(id, retryFailed, button) {
+  const oldText = button.textContent;
+  button.disabled = true;
+  button.textContent = '…';
+  try {
+    await api(`/api/processing/batches/${encodeURIComponent(id)}/run`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ retryFailed }),
+    });
+    await Promise.all([loadProcessingBatches(), loadLogs(), loadLibrary()]);
+  } catch (error) {
+    button.textContent = error.message;
+    setTimeout(() => { button.textContent = oldText; button.disabled = false; }, 2500);
+  }
+}
+
+async function retryProcessingItem(batchId, itemId, button) {
+  const oldText = button.textContent;
+  button.disabled = true;
+  button.textContent = '…';
+  try {
+    await api(`/api/processing/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}/retry`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    await Promise.all([loadProcessingBatches(), loadLogs(), loadLibrary()]);
+  } catch (error) {
+    button.textContent = error.message;
+    setTimeout(() => { button.textContent = oldText; button.disabled = false; }, 2500);
+  }
+}
+
+async function createProcessingBatch(event) {
+  event.preventDefault();
+  const inputs = [...$('#processing-batch-inputs').selectedOptions].map(option => option.value).filter(Boolean);
+  const outputFolder = $('#processing-output-folder').value.trim();
+  const template = $('#processing-output-template').value.trim();
+  const overlayPath = $('#processing-batch-overlay').value.trim();
+  if (!inputs.length) return setMessage('#processing-batch-message', 'Выберите хотя бы один исходник из библиотеки.', 'error');
+  if (inputs.length > 50) return setMessage('#processing-batch-message', 'В одном пакете доступно не более 50 исходников.', 'error');
+  if (!outputFolder || !template) return setMessage('#processing-batch-message', 'Укажите папку и шаблон имени для результатов.', 'error');
+  if (!template.toLowerCase().endsWith('.mp4')) return setMessage('#processing-batch-message', 'Шаблон имени должен оканчиваться на .mp4.', 'error');
+  if (/[\\/]/.test(template)) return setMessage('#processing-batch-message', 'В шаблоне укажите только имя файла, без папок.', 'error');
+  let jobs;
+  try {
+    const outputs = new Set();
+    jobs = inputs.map((inputPath, index) => {
+      const source = state.library.find(item => item.filePath === inputPath) || { filePath: inputPath };
+      const fileName = template
+        .replaceAll('{name}', processingFileName(source))
+        .replaceAll('{index}', String(index + 1));
+      const outputPath = joinProcessingOutput(outputFolder, fileName);
+      if (outputs.has(outputPath)) throw new Error('Шаблон сформировал одинаковые имена результатов. Добавьте {index}.');
+      outputs.add(outputPath);
+      return { inputPath, outputPath, overlayPath };
+    });
+  } catch (error) {
+    return setMessage('#processing-batch-message', error.message, 'error');
+  }
+  const button = $('#processing-batch-submit');
+  button.disabled = true;
+  button.textContent = 'Проверка путей…';
+  setMessage('#processing-batch-message', `Проверяем ${jobs.length} исходников и создаём очередь…`);
+  try {
+    const result = await api('/api/processing/batches', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jobs, concurrency: Number($('#processing-batch-concurrency').value), autoRun: $('#processing-batch-auto-run').checked }),
+    });
+    setMessage('#processing-batch-message', result.batch.autoRun
+      ? `Создан пакет: ${result.batch.total} отдельных выходных файлов поставлены в очередь.`
+      : `Создан пакет из ${result.batch.total} файлов. Нажмите «Запустить» в карточке пакета.`);
+    $('#processing-batch-inputs').selectedIndex = -1;
+    renderProcessingInputPicker();
+    await Promise.all([loadProcessingBatches(), loadLogs(), loadLibrary()]);
+  } catch (error) {
+    setMessage('#processing-batch-message', error.message, 'error');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Создать пакет обработки';
+  }
 }
 
 async function importProxies() {

@@ -18,6 +18,7 @@ const productionHashBefore = fs.existsSync(productionStatePath)
   : null;
 const inputPath = path.join(process.cwd(), '.test-input.mp4');
 const outputPath = path.join(process.cwd(), '.test-output.mp4');
+const processingOutputPath = path.join(testStateDir, 'batch-processed.mp4');
 const bulkVideoPath = path.join(testStateDir, 'bulk-source.mp4');
 const channelAvatarPath = path.join(testStateDir, 'channel-avatar.png');
 fs.writeFileSync(bulkVideoPath, 'bulk queue test source');
@@ -332,6 +333,22 @@ try {
       createdAt: '2026-01-01T00:00:00.000Z',
       updatedAt: '2026-01-01T00:00:00.000Z',
     }],
+    processingBatches: [{
+      id: 'interrupted-processing-batch',
+      status: 'running',
+      concurrency: 1,
+      autoRun: true,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      items: [{
+        id: 'interrupted-processing-item',
+        inputPath: bulkVideoPath,
+        outputPath: processingOutputPath,
+        status: 'running',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      }],
+    }],
   }));
   const recoveryProbe = `
     import { once } from 'node:events';
@@ -340,10 +357,15 @@ try {
     const { server } = await import('./server.js?recovery-probe=1');
     if (!server.listening) await once(server, 'listening');
     const address = server.address();
-    const response = await fetch('http://127.0.0.1:' + address.port + '/api/channels/tasks');
-    const payload = await response.json();
+    const [channelResponse, processingResponse] = await Promise.all([
+      fetch('http://127.0.0.1:' + address.port + '/api/channels/tasks'),
+      fetch('http://127.0.0.1:' + address.port + '/api/processing/batches'),
+    ]);
+    const channelPayload = await channelResponse.json();
+    const processingPayload = await processingResponse.json();
+    const payload = { tasks: channelPayload.tasks, processing: processingPayload };
     await new Promise(resolve => server.close(resolve));
-    previousLog(JSON.stringify(payload.tasks));
+    previousLog(JSON.stringify(payload));
   `;
   const recoveryProbeResult = await promisify(execFile)(process.execPath, ['--input-type=module', '--eval', recoveryProbe], {
     cwd: process.cwd(),
@@ -355,10 +377,14 @@ try {
       CREATOR_FLOW_HOST: '127.0.0.1',
     },
   });
-  const recoveredChannelTasks = JSON.parse(recoveryProbeResult.stdout.trim());
+  const recoveredProbe = JSON.parse(recoveryProbeResult.stdout.trim());
+  const recoveredChannelTasks = recoveredProbe.tasks;
   assert.equal(recoveredChannelTasks.length, 1);
   assert.equal(recoveredChannelTasks[0].status, 'recovery-needed');
   assert.match(recoveredChannelTasks[0].message, /прервано перезапуском/i);
+  assert.equal(recoveredProbe.processing.batches.length, 1);
+  assert.equal(recoveredProbe.processing.batches[0].status, 'needs-attention');
+  assert.equal(recoveredProbe.processing.batches[0].items[0].status, 'recovery-needed');
   const invalidLibraryUpload = await fetch(`${base}/api/library/upload?name=broken.mp4`, {
     method: 'POST',
     headers: { 'content-type': 'application/octet-stream' },
@@ -383,7 +409,31 @@ try {
     assert.equal(streamedItem.source, 'uploaded');
     assert.equal(streamedItem.hasVideo, true);
     assert.ok(fs.existsSync(streamedItem.filePath));
-    const render = await (await fetch(`${base}/api/uniqueizer/render`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ inputPath, outputPath }) })).json();
+    const invalidProcessingBatch = await fetch(`${base}/api/processing/batches`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jobs: [{ inputPath: streamedItem.filePath, outputPath: path.join(testStateDir, 'not-an-mp4.mov') }] }),
+    });
+    assert.equal(invalidProcessingBatch.status, 400);
+    const processingBatchResponse = await fetch(`${base}/api/processing/batches`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jobs: [{ inputPath: streamedItem.filePath, outputPath: processingOutputPath }], concurrency: 1, autoRun: false }),
+    });
+    assert.equal(processingBatchResponse.status, 201);
+    const processingBatch = await processingBatchResponse.json();
+    assert.equal(processingBatch.batch.total, 1);
+    assert.equal(processingBatch.batch.status, 'queued');
+    assert.equal(processingBatch.batch.autoRun, false);
+    assert.equal(processingBatch.batch.items[0].status, 'queued');
+    assert.equal(processingBatch.processor.limit, 3);
+    const processingBatches = await (await fetch(`${base}/api/processing/batches`)).json();
+    assert.equal(processingBatches.batches.length, 1);
+    assert.equal(processingBatches.batches[0].items[0].outputPath, processingOutputPath);
+    const startedProcessingBatch = await fetch(`${base}/api/processing/batches/${processingBatch.batch.id}/run`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
+    });
+    assert.equal(startedProcessingBatch.status, 202);
+    assert.equal((await startedProcessingBatch.json()).batch.autoRun, true);
+    const render = await (await fetch(`${base}/api/uniqueizer/render`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ inputPath: streamedItem.filePath, outputPath }) })).json();
     assert.equal(render.status, 'completed'); assert.ok(fs.existsSync(outputPath));
     const imported = await (await fetch(`${base}/api/library/import`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ filePath: outputPath }) })).json();
     assert.equal(imported.item.hasVideo, true);
@@ -397,6 +447,7 @@ try {
   await new Promise(resolve => localDolphinMock.close(resolve));
   fs.rmSync(inputPath, { force: true });
   fs.rmSync(outputPath, { force: true });
+  fs.rmSync(processingOutputPath, { force: true });
   fs.rmSync(bulkVideoPath, { force: true });
   fs.rmSync(channelAvatarPath, { force: true });
   fs.rmSync(testStateDir, { recursive: true, force: true });

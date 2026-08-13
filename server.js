@@ -24,6 +24,10 @@ const proxies = [];
 const videos = [];
 const channelTasks = [];
 const library = [];
+// A processing batch is intentionally separate from upload and Dolphin work.
+// It contains only explicit local input/output pairs for media the operator
+// has already placed in the Creator Flow library.
+const processingBatches = [];
 const studioCache = {};
 const studioSyncBatches = [];
 // Account status is intentionally a small, read-only cache.  It never keeps
@@ -44,6 +48,9 @@ let schedulerRunning = false;
 let studioBatchPumpRunning = false;
 let accountCheckBatchPumpRunning = false;
 let channelTaskPumpRunning = false;
+let processingBatchPumpRunning = false;
+const activeProcessingJobIds = new Set();
+const activeProcessingOutputPaths = new Set();
 const execFileAsync = promisify(execFile);
 const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
 const ffprobeBin = process.env.FFPROBE_PATH || (path.basename(ffmpegBin).toLowerCase().startsWith('ffmpeg') ? path.join(path.dirname(ffmpegBin), process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe') : 'ffprobe');
@@ -69,6 +76,7 @@ if (fs.existsSync(statePath)) {
     videos.push(...realVideos);
     channelTasks.push(...(saved.channelTasks || []));
     library.push(...(saved.library || []));
+    processingBatches.push(...(Array.isArray(saved.processingBatches) ? saved.processingBatches.filter(isObjectRecord) : []));
     Object.assign(studioCache, saved.studioCache || {});
     studioSyncBatches.push(...(saved.studioSyncBatches || []));
     const persistedAccounts = isObjectRecord(saved.accountStatusCache) ? saved.accountStatusCache : {};
@@ -112,6 +120,32 @@ for (const task of channelTasks) {
     stateNeedsCleanup = true;
   }
 }
+for (const batch of processingBatches) {
+  if (!Array.isArray(batch.items)) {
+    batch.items = [];
+    stateNeedsCleanup = true;
+  } else {
+    const validItems = batch.items.filter(isObjectRecord);
+    if (validItems.length !== batch.items.length) {
+      batch.items = validItems;
+      stateNeedsCleanup = true;
+    }
+  }
+  for (const item of batch.items) {
+    if (item.status === 'running') {
+      // A local encoder may have written a partial temporary file when the
+      // panel was stopped. Never silently repeat that operation or mark it as
+      // complete; it must be retried explicitly after inspecting the output.
+      item.status = 'recovery-needed';
+      item.message = 'Обработка была прервана перезапуском. Проверьте выходной файл и при необходимости перезапустите только эту задачу.';
+      item.updatedAt = new Date().toISOString();
+      stateNeedsCleanup = true;
+    }
+  }
+  const previousStatus = batch.status;
+  refreshProcessingBatchStatus(batch);
+  if (batch.status !== previousStatus) stateNeedsCleanup = true;
+}
 for (const batch of studioSyncBatches) {
   for (const item of batch.items || []) {
     if (item.status === 'running') {
@@ -149,7 +183,7 @@ function saveState() {
   if (stateLoadError) {
     throw new Error('Локальное состояние не прочитано; исходный файл сохранён как резервная копия. Восстановите его перед изменением данных.');
   }
-  const payload = JSON.stringify({ tasks, proxies, videos, channelTasks, library, studioCache, studioSyncBatches, accountStatusCache, accountCheckBatches, automationSessions, settings }, null, 2);
+  const payload = JSON.stringify({ tasks, proxies, videos, channelTasks, library, processingBatches, studioCache, studioSyncBatches, accountStatusCache, accountCheckBatches, automationSessions, settings }, null, 2);
   const tempPath = `${statePath}.${process.pid}.${Date.now()}.tmp`;
   try {
     fs.writeFileSync(tempPath, payload);
@@ -589,6 +623,275 @@ async function streamLibraryUpload(request, tempPath) {
     throw error;
   }
 }
+
+// Local media processing deliberately has a much smaller bound than the
+// network/profile worker pool. FFmpeg is CPU and disk intensive, so a batch
+// defaults to one encoder and can use at most three concurrent encoders.
+const MAX_PROCESSING_BATCH_SIZE = 50;
+const MAX_PROCESSING_BATCHES = 20;
+const MAX_PROCESSING_CONCURRENCY = 3;
+const processingOutputExtensions = new Set(['.mp4']);
+
+function processingError(message, statusCode = 400, code = 'processing-invalid') {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.code = code;
+  return error;
+}
+
+function normalizeProcessingPath(value, label) {
+  if (typeof value !== 'string') throw processingError(`${label} должен быть путём к файлу.`);
+  const rawPath = value.trim();
+  if (!rawPath || rawPath.length > 4_096 || rawPath.includes('\0')) {
+    throw processingError(`${label} указан неверно.`);
+  }
+  return path.resolve(rawPath);
+}
+
+function normalizeProcessingOverlay(value) {
+  if (value === undefined || value === null || value === '') return '';
+  const overlayPath = normalizeProcessingPath(value, 'Путь к оверлею');
+  const extension = path.extname(overlayPath).toLowerCase();
+  if (extension !== '.png') throw processingError('Для оверлея поддерживается PNG-файл.');
+  try {
+    if (!fs.statSync(overlayPath).isFile()) throw new Error('not-a-file');
+  } catch {
+    throw processingError('PNG-оверлей не найден по указанному пути.');
+  }
+  return overlayPath;
+}
+
+function libraryOwnsProcessingInput(filePath) {
+  return library.some(item => {
+    try { return path.resolve(item.filePath) === filePath; }
+    catch { return false; }
+  });
+}
+
+async function normalizeProcessingJob(rawJob, index, seenInputs, seenOutputs) {
+  if (!isObjectRecord(rawJob)) throw processingError(`Задача ${index + 1} должна быть объектом.`);
+  const inputPath = normalizeProcessingPath(rawJob.inputPath, `Исходник ${index + 1}`);
+  const outputPath = normalizeProcessingPath(rawJob.outputPath, `Выходной файл ${index + 1}`);
+  if (!libraryOwnsProcessingInput(inputPath)) {
+    throw processingError(`Исходник ${index + 1} нужно сначала добавить в библиотеку Creator Flow.`);
+  }
+  if (inputPath === outputPath) throw processingError(`Исходник и выходной файл ${index + 1} не должны совпадать.`);
+  if (!processingOutputExtensions.has(path.extname(outputPath).toLowerCase())) {
+    throw processingError(`Выходной файл ${index + 1} должен иметь расширение .mp4.`);
+  }
+  if (seenInputs.has(inputPath)) throw processingError(`Один исходник указан дважды (задача ${index + 1}).`);
+  if (seenOutputs.has(outputPath)) throw processingError(`Один выходной путь указан дважды (задача ${index + 1}).`);
+  let outputDirectory;
+  try { outputDirectory = fs.statSync(path.dirname(outputPath)); }
+  catch { throw processingError(`Папка для выходного файла ${index + 1} не найдена.`); }
+  if (!outputDirectory.isDirectory()) throw processingError(`Папка для выходного файла ${index + 1} недоступна.`);
+  if (fs.existsSync(outputPath)) throw processingError(`Выходной файл ${index + 1} уже существует. Укажите новый путь.`);
+  const inputMetadata = await inspectMediaFile(inputPath, { ffprobeBin });
+  if (!inputMetadata.hasVideo) throw processingError(`В исходнике ${index + 1} не найден видеопоток.`);
+  const overlayPath = normalizeProcessingOverlay(rawJob.overlayPath);
+  seenInputs.add(inputPath);
+  seenOutputs.add(outputPath);
+  return {
+    id: crypto.randomUUID(),
+    inputPath,
+    outputPath,
+    overlayPath,
+    status: 'queued',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    message: 'Ожидает свободный локальный обработчик.',
+  };
+}
+
+function processingBatchSummary(batch) {
+  const counts = (batch.items || []).reduce((result, item) => {
+    result[item.status] = (result[item.status] || 0) + 1;
+    return result;
+  }, {});
+  return {
+    total: batch.items?.length || 0,
+    queued: counts.queued || 0,
+    running: counts.running || 0,
+    completed: counts.completed || 0,
+    failed: counts.error || 0,
+    recoveryNeeded: counts['recovery-needed'] || 0,
+  };
+}
+
+function refreshProcessingBatchStatus(batch) {
+  const summary = processingBatchSummary(batch);
+  const status = summary.running
+    ? 'running'
+    : summary.queued
+      ? 'queued'
+    : summary.recoveryNeeded
+      ? 'needs-attention'
+      : summary.failed
+        ? 'completed-with-errors'
+        : 'completed';
+  if (batch.status !== status) {
+    batch.status = status;
+    batch.updatedAt = new Date().toISOString();
+  }
+  return summary;
+}
+
+function publicProcessingBatch(batch) {
+  const summary = processingBatchSummary(batch);
+  return {
+    id: batch.id,
+    source: 'own-media-batch',
+    createdAt: batch.createdAt,
+    updatedAt: batch.updatedAt,
+    status: batch.status,
+    concurrency: batch.concurrency,
+    autoRun: batch.autoRun === true,
+    ...summary,
+    items: (batch.items || []).map(item => ({
+      id: item.id,
+      inputPath: item.inputPath,
+      outputPath: item.outputPath,
+      overlayPath: item.overlayPath || '',
+      status: item.status,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      message: cleanAccountText(item.message, 600),
+      error: cleanAccountText(item.error, 600),
+      item: item.libraryItem ? { id: item.libraryItem.id, fileName: item.libraryItem.fileName, filePath: item.libraryItem.filePath } : null,
+    })),
+  };
+}
+
+function processingTempPath(item) {
+  const extension = path.extname(item.outputPath) || '.mp4';
+  const base = path.basename(item.outputPath, extension);
+  return path.join(path.dirname(item.outputPath), `.${base}.${item.id}.processing${extension}`);
+}
+
+async function renderProcessingJob(item) {
+  const temporaryPath = processingTempPath(item);
+  if (fs.existsSync(item.outputPath)) throw processingError('Выходной файл уже существует. Для повторной обработки укажите новый путь.', 409, 'processing-output-exists');
+  if (fs.existsSync(temporaryPath)) await fs.promises.rm(temporaryPath, { force: true });
+  const args = ['-hide_banner', '-nostdin', '-n', '-i', item.inputPath];
+  if (item.overlayPath) {
+    args.push('-i', item.overlayPath, '-filter_complex', '[0:v][1:v]overlay=0:0:format=auto[v]', '-map', '[v]', '-map', '0:a?');
+  } else {
+    args.push('-map', '0:v:0', '-map', '0:a?');
+  }
+  args.push('-map_metadata', '-1', '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-c:a', 'aac', '-movflags', '+faststart', temporaryPath);
+  try {
+    await execFileAsync(ffmpegBin, args, { windowsHide: true, maxBuffer: 2 * 1024 * 1024 });
+    const metadata = await inspectMediaFile(temporaryPath, { ffprobeBin });
+    if (!metadata.hasVideo) throw new Error('FFmpeg не создал выходной видеопоток.');
+    await fs.promises.rename(temporaryPath, item.outputPath);
+    return { ...metadata, filePath: item.outputPath, fileName: path.basename(item.outputPath) };
+  } catch (error) {
+    await fs.promises.rm(temporaryPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function runProcessingBatchItem(batch, item) {
+  item.status = 'running';
+  item.error = '';
+  item.message = 'FFmpeg обрабатывает исходный файл.';
+  item.updatedAt = new Date().toISOString();
+  refreshProcessingBatchStatus(batch);
+  saveState();
+  try {
+    if (!libraryOwnsProcessingInput(item.inputPath)) {
+      throw processingError('Исходник больше не находится в библиотеке Creator Flow.');
+    }
+    const inputMetadata = await inspectMediaFile(item.inputPath, { ffprobeBin });
+    if (!inputMetadata.hasVideo) throw processingError('В исходном файле больше не найден видеопоток.');
+    if (item.overlayPath) normalizeProcessingOverlay(item.overlayPath);
+    const metadata = await renderProcessingJob(item);
+    const existing = library.find(entry => {
+      try { return path.resolve(entry.filePath) === path.resolve(metadata.filePath); }
+      catch { return false; }
+    });
+    const libraryItem = existing || makeLibraryEntry(metadata, 'processed-batch');
+    if (!existing) library.unshift(libraryItem);
+    item.libraryItem = { id: libraryItem.id, fileName: libraryItem.fileName, filePath: libraryItem.filePath };
+    item.status = 'completed';
+    item.message = 'Обработка завершена; отдельный выходной файл добавлен в библиотеку.';
+    addLog(`Пакетная обработка завершена: ${metadata.fileName}`, null, 'info');
+  } catch (error) {
+    item.status = 'error';
+    item.error = cleanAccountText(error.message, 600);
+    item.message = 'Выходной файл не создан. Проверьте пути и повторите задачу только после исправления причины.';
+    addLog(`Ошибка пакетной обработки: ${item.error || 'неизвестная ошибка'}`, null, 'error');
+  }
+  item.updatedAt = new Date().toISOString();
+  refreshProcessingBatchStatus(batch);
+  saveState();
+  return item;
+}
+
+function startProcessingBatchItem(batch, item) {
+  if (activeProcessingJobIds.has(item.id)) return { started: false, code: 'processing-already-running' };
+  if (activeProcessingOutputPaths.has(item.outputPath)) return { started: false, code: 'processing-output-busy' };
+  activeProcessingJobIds.add(item.id);
+  activeProcessingOutputPaths.add(item.outputPath);
+  const promise = runProcessingBatchItem(batch, item)
+    .finally(() => {
+      activeProcessingJobIds.delete(item.id);
+      activeProcessingOutputPaths.delete(item.outputPath);
+      if (backgroundEnabled) {
+        queueMicrotask(() => processProcessingBatches().catch(error => addLog(`Ошибка очереди обработки файлов: ${error.message}`, null, 'error')));
+      }
+    });
+  return { started: true, promise };
+}
+
+async function processProcessingBatches() {
+  if (processingBatchPumpRunning) return;
+  processingBatchPumpRunning = true;
+  try {
+    for (const batch of processingBatches) {
+      if (!['queued', 'running'].includes(batch.status)) continue;
+      if (batch.autoRun !== true) continue;
+      const limit = Math.min(Math.max(Number(batch.concurrency) || 1, 1), MAX_PROCESSING_CONCURRENCY);
+      while (true) {
+        const batchActive = (batch.items || []).filter(item => activeProcessingJobIds.has(item.id)).length;
+        if (batchActive >= limit) break;
+        const item = (batch.items || []).find(candidate => (
+          candidate.status === 'queued'
+          && !activeProcessingJobIds.has(candidate.id)
+          && !activeProcessingOutputPaths.has(candidate.outputPath)
+        ));
+        if (!item) break;
+        const operation = startProcessingBatchItem(batch, item);
+        if (!operation.started) break;
+        operation.promise.catch(error => addLog(`Ошибка локальной обработки: ${error.message}`, null, 'error'));
+      }
+      refreshProcessingBatchStatus(batch);
+    }
+    saveState();
+  } finally {
+    processingBatchPumpRunning = false;
+  }
+}
+
+function assertProcessingRetryable(item) {
+  if (!['error', 'recovery-needed'].includes(item.status)) {
+    throw processingError('Повторно можно запускать только задачу с ошибкой или прерванную перезапуском.', 409, 'processing-invalid-state');
+  }
+  if (fs.existsSync(item.outputPath)) {
+    throw processingError('По этому пути уже есть выходной файл. Проверьте его и укажите новый путь для повторной обработки.', 409, 'processing-output-exists');
+  }
+}
+
+function queueProcessingRetry(batch, item) {
+  assertProcessingRetryable(item);
+  item.status = 'queued';
+  item.error = '';
+  item.message = 'Повторно поставлена в очередь обработки.';
+  item.updatedAt = new Date().toISOString();
+  refreshProcessingBatchStatus(batch);
+  saveState();
+}
+
 const MAX_BULK_UPLOAD_TASKS = 100;
 function normalizeBulkProfileIds(rawIds) {
   if (!Array.isArray(rawIds)) return { error: 'profileIds must be an array.' };
@@ -869,6 +1172,7 @@ const scheduler = setInterval(() => {
   processStudioSyncBatches().catch(error => addLog(`Ошибка очереди пакетной синхронизации: ${error.message}`, null, 'error'));
   processAccountCheckBatches().catch(error => addLog(`Ошибка очереди проверки аккаунтов: ${error.message}`, null, 'error'));
   processScheduledChannelTasks().catch(error => addLog(`Ошибка очереди оформления каналов: ${error.message}`, null, 'error'));
+  processProcessingBatches().catch(error => addLog(`Ошибка очереди обработки файлов: ${error.message}`, null, 'error'));
 }, 5000);
 scheduler.unref();
 const manualSessionJanitor = setInterval(() => { expireManualSessions().catch(error => addLog(`Ошибка очистки ручных сессий: ${error.message}`, null, 'error')); }, 60_000);
@@ -1922,6 +2226,102 @@ app.post('/api/channels/tasks/:id/run', async (req, res) => {
   res.json(task);
 });
 
+app.get('/api/processing/batches', (_req, res) => {
+  res.json({
+    batches: processingBatches
+      .slice(0, MAX_PROCESSING_BATCHES)
+      .map(publicProcessingBatch),
+    processor: {
+      active: activeProcessingJobIds.size,
+      limit: MAX_PROCESSING_CONCURRENCY,
+    },
+  });
+});
+
+app.post('/api/processing/batches', async (req, res) => {
+  const rawJobs = req.body?.jobs;
+  if (!Array.isArray(rawJobs) || !rawJobs.length) {
+    return res.status(400).json({ error: 'Добавьте хотя бы одну пару «исходник — выходной файл».', code: 'processing-empty' });
+  }
+  if (rawJobs.length > MAX_PROCESSING_BATCH_SIZE) {
+    return res.status(400).json({ error: `За один пакет доступно не более ${MAX_PROCESSING_BATCH_SIZE} исходных файлов.`, code: 'processing-too-large' });
+  }
+  const requestedConcurrency = req.body?.concurrency === undefined ? 1 : Number(req.body.concurrency);
+  if (!Number.isInteger(requestedConcurrency) || requestedConcurrency < 1 || requestedConcurrency > MAX_PROCESSING_CONCURRENCY) {
+    return res.status(400).json({ error: `Для локальной обработки выберите от 1 до ${MAX_PROCESSING_CONCURRENCY} потоков.`, code: 'processing-invalid-concurrency' });
+  }
+  try {
+    const seenInputs = new Set();
+    const seenOutputs = new Set();
+    const items = [];
+    for (let index = 0; index < rawJobs.length; index += 1) {
+      items.push(await normalizeProcessingJob(rawJobs[index], index, seenInputs, seenOutputs));
+    }
+    const now = new Date().toISOString();
+    const batch = {
+      id: crypto.randomUUID(),
+      source: 'own-media-batch',
+      createdAt: now,
+      updatedAt: now,
+      status: 'queued',
+      concurrency: requestedConcurrency,
+      autoRun: req.body?.autoRun !== false,
+      items,
+    };
+    processingBatches.unshift(batch);
+    if (processingBatches.length > MAX_PROCESSING_BATCHES) processingBatches.splice(MAX_PROCESSING_BATCHES);
+    refreshProcessingBatchStatus(batch);
+    saveState();
+    addLog(`Создан пакет локальной обработки: ${items.length} собственных исходников.`, null, 'info');
+    if (backgroundEnabled && batch.autoRun) {
+      processProcessingBatches().catch(error => addLog(`Ошибка запуска пакетной обработки: ${error.message}`, null, 'error'));
+    }
+    return res.status(201).json({ batch: publicProcessingBatch(batch), processor: { active: activeProcessingJobIds.size, limit: MAX_PROCESSING_CONCURRENCY } });
+  } catch (error) {
+    return res.status(error.statusCode || 422).json({ error: error.message, code: error.code || 'processing-validation-failed' });
+  }
+});
+
+app.post('/api/processing/batches/:id/run', async (req, res) => {
+  const batch = processingBatches.find(item => item.id === req.params.id);
+  if (!batch) return res.status(404).json({ error: 'Пакет обработки не найден.' });
+  if (batch.status === 'completed') return res.status(409).json({ error: 'Этот пакет уже завершён.', code: 'processing-completed' });
+  try {
+    if (req.body?.retryFailed === true) {
+      const retryItems = (batch.items || []).filter(item => ['error', 'recovery-needed'].includes(item.status));
+      retryItems.forEach(assertProcessingRetryable);
+      retryItems.forEach(item => queueProcessingRetry(batch, item));
+    }
+    const hasQueued = (batch.items || []).some(item => item.status === 'queued');
+    if (!hasQueued) {
+      return res.status(409).json({ error: 'В пакете нет задач, готовых к запуску. Для повторной попытки включите повтор задач с ошибками.', code: 'processing-no-queued-items' });
+    }
+    batch.autoRun = true;
+    batch.updatedAt = new Date().toISOString();
+    refreshProcessingBatchStatus(batch);
+    saveState();
+    if (backgroundEnabled) processProcessingBatches().catch(error => addLog(`Ошибка очереди обработки файлов: ${error.message}`, null, 'error'));
+    return res.status(202).json({ batch: publicProcessingBatch(batch), processor: { active: activeProcessingJobIds.size, limit: MAX_PROCESSING_CONCURRENCY } });
+  } catch (error) {
+    return res.status(error.statusCode || 422).json({ error: error.message, code: error.code || 'processing-retry-failed' });
+  }
+});
+
+app.post('/api/processing/batches/:batchId/items/:itemId/retry', async (req, res) => {
+  const batch = processingBatches.find(item => item.id === req.params.batchId);
+  if (!batch) return res.status(404).json({ error: 'Пакет обработки не найден.' });
+  const item = (batch.items || []).find(candidate => candidate.id === req.params.itemId);
+  if (!item) return res.status(404).json({ error: 'Задача обработки не найдена.' });
+  try {
+    queueProcessingRetry(batch, item);
+    batch.autoRun = true;
+    if (backgroundEnabled) processProcessingBatches().catch(error => addLog(`Ошибка очереди обработки файлов: ${error.message}`, null, 'error'));
+    return res.status(202).json({ batch: publicProcessingBatch(batch), item: publicProcessingBatch({ ...batch, items: [item] }).items[0] });
+  } catch (error) {
+    return res.status(error.statusCode || 422).json({ error: error.message, code: error.code || 'processing-retry-failed' });
+  }
+});
+
 app.get('/api/uniqueizer/health', async (_req, res) => {
   try { const result = await execFileAsync(ffmpegBin, ['-version']); res.json({ available: true, path: ffmpegBin, version: result.stdout.split('\n')[0] }); }
   catch { res.json({ available: false, message: 'FFmpeg не найден. Установите FFmpeg и добавьте его в PATH.' }); }
@@ -1930,24 +2330,43 @@ app.get('/api/uniqueizer/health', async (_req, res) => {
 app.post('/api/uniqueizer/render', async (req, res) => {
   const { inputPath, outputPath, overlayPath } = req.body || {};
   if (!inputPath || !outputPath) return res.status(400).json({ error: 'inputPath и outputPath обязательны' });
-  try { await inspectMediaFile(inputPath, { ffprobeBin }); }
+  let safeInputPath;
+  let safeOutputPath;
+  let safeOverlayPath = '';
+  try {
+    safeInputPath = normalizeProcessingPath(inputPath, 'Исходник');
+    safeOutputPath = normalizeProcessingPath(outputPath, 'Выходной файл');
+    if (!libraryOwnsProcessingInput(safeInputPath)) throw processingError('Исходник нужно сначала добавить в библиотеку Creator Flow.');
+    if (safeInputPath === safeOutputPath) throw processingError('Исходник и выходной файл не должны совпадать.');
+    if (!processingOutputExtensions.has(path.extname(safeOutputPath).toLowerCase())) throw processingError('Выходной файл должен иметь расширение .mp4.');
+    const outputDirectory = fs.statSync(path.dirname(safeOutputPath));
+    if (!outputDirectory.isDirectory()) throw processingError('Папка для выходного файла недоступна.');
+    if (fs.existsSync(safeOutputPath)) throw processingError('Выходной файл уже существует. Укажите новый путь.', 409, 'processing-output-exists');
+    safeOverlayPath = normalizeProcessingOverlay(overlayPath);
+    const metadata = await inspectMediaFile(safeInputPath, { ffprobeBin });
+    if (!metadata.hasVideo) throw processingError('В исходном файле не найден видеопоток.');
+  }
   catch (error) { return res.status(422).json({ status: 'error', error: error.message }); }
-  const args = ['-y', '-i', inputPath];
-  if (overlayPath) args.push('-i', overlayPath, '-filter_complex', '[0:v][1:v]overlay=0:0:format=auto');
-  args.push('-map_metadata', '-1', '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-c:a', 'aac', outputPath);
+  const args = ['-hide_banner', '-nostdin', '-n', '-i', safeInputPath];
+  if (safeOverlayPath) args.push('-i', safeOverlayPath, '-filter_complex', '[0:v][1:v]overlay=0:0:format=auto[v]', '-map', '[v]', '-map', '0:a?');
+  else args.push('-map', '0:v:0', '-map', '0:a?');
+  args.push('-map_metadata', '-1', '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-c:a', 'aac', '-movflags', '+faststart', safeOutputPath);
   try {
     await execFileAsync(ffmpegBin, args, { windowsHide: true });
-    const metadata = await inspectMediaFile(outputPath, { ffprobeBin });
+    const metadata = await inspectMediaFile(safeOutputPath, { ffprobeBin });
     const existing = library.find(item => path.resolve(item.filePath) === path.resolve(metadata.filePath));
     const item = existing || makeLibraryEntry(metadata, 'processed');
     if (!existing) library.unshift(item);
     saveState(); addLog(`Обработка завершена: ${metadata.fileName}`);
-    res.status(201).json({ status: 'completed', outputPath, item });
+    res.status(201).json({ status: 'completed', outputPath: safeOutputPath, item });
   }
   catch (error) { res.status(422).json({ status: 'error', error: error.message, hint: 'Установите FFmpeg и проверьте пути к файлам.' }); }
 });
 
 const serverPort = Number(process.env.PORT || 3030);
 const serverHost = String(process.env.CREATOR_FLOW_HOST || '127.0.0.1').trim() || '127.0.0.1';
+if (backgroundEnabled) {
+  queueMicrotask(() => processProcessingBatches().catch(error => addLog(`Ошибка запуска очереди обработки файлов: ${error.message}`, null, 'error')));
+}
 const server = app.listen(serverPort, serverHost, () => console.log(`Creator Flow: http://${serverHost}:${server.address().port}`));
 export { app, server };
