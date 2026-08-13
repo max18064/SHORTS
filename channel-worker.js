@@ -25,6 +25,12 @@ const fileInputSelector = 'input[type="file"]';
 const customizationHrefSelector = 'a[href*="/customization"], a[href*="/editing"], [role="link"][href*="/customization"], [role="link"][href*="/editing"]';
 const brandingHrefSelector = 'a[href*="branding"], [role="link"][href*="branding"]';
 const basicInfoHrefSelector = 'a[href*="basic"], a[href*="info"], [role="link"][href*="basic"], [role="link"][href*="info"]';
+// Studio's current channel editor is a single `/editing/profile` surface in
+// some accounts. Keep these ASCII-escaped so the worker remains portable
+// through Windows shells with non-UTF-8 console code pages.
+const profileTabText = /(?:\u041f\u0440\u043e\u0444\u0438\u043b\u044c|profile)/i;
+const channelNamePlaceholder = /(?:\u0423\u043a\u0430\u0436\u0438\u0442\u0435\s+\u043d\u0430\u0437\u0432\u0430\u043d\u0438\u0435\s+\u043a\u0430\u043d\u0430\u043b\u0430|channel\s+name)/i;
+const descriptionFieldHint = /(?:\u041e\u043f\u0438\u0441\u0430\u043d\u0438|description)/i;
 
 function operationTimeout(value) {
   const parsed = Number.parseInt(value ?? process.env.CREATOR_FLOW_BROWSER_OPERATION_TIMEOUT_MS, 10);
@@ -161,14 +167,21 @@ async function settleStudioPage(page, deadline, stage) {
   ));
 }
 
-function customizationUrlFromCurrentPage(currentUrl) {
+function customizationUrlsFromCurrentPage(currentUrl) {
   try {
     const url = new URL(currentUrl);
     const match = url.pathname.match(/\/channel\/([^/?#]+)/i);
-    if (!match) return '';
-    return `${url.origin}/channel/${encodeURIComponent(match[1])}/editing`;
+    if (!match) return [];
+    const channelId = encodeURIComponent(match[1]);
+    // `/editing/profile` is the live route exposed by current Studio. Keep
+    // the older routes as fallbacks for accounts that still use them.
+    return [
+      `${url.origin}/channel/${channelId}/editing/profile`,
+      `${url.origin}/channel/${channelId}/editing`,
+      `${url.origin}/channel/${channelId}/customization`,
+    ];
   } catch {
-    return '';
+    return [];
   }
 }
 
@@ -203,8 +216,8 @@ async function openChannelCustomization(page, deadline) {
     if (isCustomizationPage(page.url())) return true;
   }
 
-  const directUrl = customizationUrlFromCurrentPage(page.url());
-  if (directUrl) {
+  const directUrls = customizationUrlsFromCurrentPage(page.url());
+  for (const directUrl of directUrls) {
     await withinDeadline(deadline, 'Переход к настройке канала', () => (
       page.goto(directUrl, {
         waitUntil: 'domcontentloaded',
@@ -222,6 +235,52 @@ async function openChannelCustomization(page, deadline) {
   }, deadline);
 }
 
+async function firstVisibleFieldWithAttribute(locator, attributes, pattern, deadline, stage) {
+  const count = await withinDeadline(deadline, `${stage}: поиск`, () => locator.count()).catch(() => 0);
+  for (let index = 0; index < Math.min(count, MAX_LOCATOR_MATCHES); index += 1) {
+    const candidate = locator.nth(index);
+    if (!await withinDeadline(deadline, `${stage}: проверка видимости`, () => candidate.isVisible()).catch(() => false)) continue;
+    for (const attribute of attributes) {
+      const value = await withinDeadline(deadline, `${stage}: чтение поля`, () => candidate.getAttribute(attribute)).catch(() => '');
+      if (pattern.test(String(value || ''))) return candidate;
+    }
+  }
+  return null;
+}
+
+async function hasChannelProfileControls(page, deadline, stage) {
+  const nameInput = await firstVisibleFieldWithAttribute(
+    page.locator('input[placeholder]'),
+    ['placeholder'],
+    channelNamePlaceholder,
+    deadline,
+    `${stage}: название канала`,
+  );
+  if (nameInput) return true;
+  const description = await firstVisibleFieldWithAttribute(
+    page.locator('textarea, [contenteditable="true"]'),
+    ['aria-label', 'placeholder'],
+    descriptionFieldHint,
+    deadline,
+    `${stage}: описание канала`,
+  );
+  if (description) return true;
+  return Boolean(await firstVisible(page.locator(fileInputSelector), deadline, `${stage}: файл оформления`));
+}
+
+async function openChannelProfileSection(page, deadline, stage) {
+  if (await hasChannelProfileControls(page, deadline, stage)) return true;
+
+  const tab = await firstVisible(page.getByRole('tab', { name: profileTabText }), deadline, `${stage}: вкладка «Профиль»`);
+  if (tab) {
+    await withinDeadline(deadline, `${stage}: открытие вкладки «Профиль»`, () => (
+      tab.click({ timeout: stepTimeout(deadline, `${stage}: открытие вкладки «Профиль»`) })
+    ));
+    await settleStudioPage(page, deadline, `${stage}: ожидание вкладки «Профиль»`);
+  }
+  return hasChannelProfileControls(page, deadline, stage);
+}
+
 async function fillByLabel(page, pattern, value, deadline, stage) {
   if (!value) return false;
   // `value` comes from the explicit task and is only written to a form field;
@@ -230,6 +289,40 @@ async function fillByLabel(page, pattern, value, deadline, stage) {
   if (!field) return false;
   await withinDeadline(deadline, `${stage}: заполнение`, () => (
     field.fill(value, { timeout: stepTimeout(deadline, `${stage}: заполнение`) })
+  ));
+  return true;
+}
+
+async function fillChannelName(page, value, deadline) {
+  if (!value) return false;
+  if (await fillByLabel(page, nameFieldName, value, deadline, 'Название канала')) return true;
+  const field = await firstVisibleFieldWithAttribute(
+    page.locator('input[placeholder]'),
+    ['placeholder'],
+    channelNamePlaceholder,
+    deadline,
+    'Название канала',
+  );
+  if (!field) return false;
+  await withinDeadline(deadline, 'Название канала: заполнение', () => (
+    field.fill(value, { timeout: stepTimeout(deadline, 'Название канала: заполнение') })
+  ));
+  return true;
+}
+
+async function fillChannelDescription(page, value, deadline) {
+  if (!value) return false;
+  if (await fillByLabel(page, descriptionFieldName, value, deadline, 'Описание канала')) return true;
+  const field = await firstVisibleFieldWithAttribute(
+    page.locator('textarea, [contenteditable="true"]'),
+    ['aria-label', 'placeholder'],
+    descriptionFieldHint,
+    deadline,
+    'Описание канала',
+  );
+  if (!field) return false;
+  await withinDeadline(deadline, 'Описание канала: заполнение', () => (
+    field.fill(value, { timeout: stepTimeout(deadline, 'Описание канала: заполнение') })
   ));
   return true;
 }
@@ -309,29 +402,36 @@ export async function updateChannelBranding({
     let descriptionChanged = false;
 
     // Channel name, description and external links live in the Basic info
-    // section in current Studio. Enter it before attempting to fill fields;
+    // section in older Studio, and directly in the Profile editor in newer
+    // Studio. Enter a known editor surface before attempting to fill fields;
     // otherwise a hidden dashboard control could make a task look complete.
     if (name || description || normalizedLinks.length) {
-      const basicInfoOpened = await openStudioSection(page, {
-        text: basicInfoText,
-        hrefSelector: basicInfoHrefSelector,
-        stage: 'Открытие основных сведений',
-      }, deadline);
-      if (!basicInfoOpened) throw new Error('В YouTube Studio не найдена вкладка «Основные сведения».');
-      nameChanged = await fillByLabel(page, nameFieldName, name, deadline, 'Название канала');
-      descriptionChanged = await fillByLabel(page, descriptionFieldName, description, deadline, 'Описание канала');
+      const profileOpened = await openChannelProfileSection(page, deadline, 'Открытие профиля канала');
+      if (!profileOpened) {
+        const basicInfoOpened = await openStudioSection(page, {
+          text: basicInfoText,
+          hrefSelector: basicInfoHrefSelector,
+          stage: 'Открытие основных сведений',
+        }, deadline);
+        if (!basicInfoOpened) throw new Error('В YouTube Studio не найдена вкладка «Профиль» или «Основные сведения».');
+      }
+      nameChanged = await fillChannelName(page, name, deadline);
+      descriptionChanged = await fillChannelDescription(page, description, deadline);
       if (name && !nameChanged) throw new Error('YouTube Studio не показала поле названия канала. Изменение не сохранено.');
       if (description && !descriptionChanged) throw new Error('YouTube Studio не показала поле описания канала. Изменение не сохранено.');
     }
 
     if (avatarPath || bannerPath) {
-      const brandingOpened = await openStudioSection(page, {
-        text: brandingText,
-        hrefSelector: brandingHrefSelector,
-        stage: 'Открытие вкладки брендинга',
-      }, deadline);
-      if (!brandingOpened) throw new Error('В YouTube Studio не найдена вкладка «Брендинг».');
-      await settleStudioPage(page, deadline, 'Ожидание вкладки брендинга');
+      const profileOpened = await openChannelProfileSection(page, deadline, 'Открытие профиля для оформления');
+      if (!profileOpened) {
+        const brandingOpened = await openStudioSection(page, {
+          text: brandingText,
+          hrefSelector: brandingHrefSelector,
+          stage: 'Открытие вкладки брендинга',
+        }, deadline);
+        if (!brandingOpened) throw new Error('В YouTube Studio не найдена вкладка «Профиль» или «Брендинг».');
+        await settleStudioPage(page, deadline, 'Ожидание вкладки брендинга');
+      }
 
       const inputs = page.locator(fileInputSelector);
       const inputCount = await withinDeadline(deadline, 'Поиск полей файлов брендинга', () => inputs.count());
