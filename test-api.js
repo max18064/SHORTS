@@ -4,6 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import http from 'node:http';
+import { once } from 'node:events';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 process.env.PORT = '0';
@@ -18,7 +19,9 @@ const productionHashBefore = fs.existsSync(productionStatePath)
 const inputPath = path.join(process.cwd(), '.test-input.mp4');
 const outputPath = path.join(process.cwd(), '.test-output.mp4');
 const bulkVideoPath = path.join(testStateDir, 'bulk-source.mp4');
+const channelAvatarPath = path.join(testStateDir, 'channel-avatar.png');
 fs.writeFileSync(bulkVideoPath, 'bulk queue test source');
+fs.writeFileSync(channelAvatarPath, 'channel branding test asset');
 const dolphinCalls = [];
 const officialFingerprint = {
   platformName: 'Win32',
@@ -74,9 +77,18 @@ const localDolphinMock = http.createServer((request, response) => {
 await new Promise(resolve => localDolphinMock.listen(0, '127.0.0.1', resolve));
 process.env.DOLPHIN_LOCAL_API = `http://127.0.0.1:${localDolphinMock.address().port}`;
 const { server } = await import('./server.js');
-const port = server.address().port;
+if (!server.listening) await once(server, 'listening');
+const serverAddress = server.address();
+assert.ok(serverAddress && typeof serverAddress === 'object');
+assert.equal(serverAddress.address, '127.0.0.1');
+const port = serverAddress.port;
 const base = `http://127.0.0.1:${port}`;
 try {
+  const panel = await fetch(`${base}/`);
+  assert.equal(panel.status, 200);
+  assert.match(await panel.text(), /Creator Flow/);
+  assert.equal((await fetch(`${base}/server.js`)).status, 404);
+  assert.equal((await fetch(`${base}/data/library/`)).status, 404);
   const health = await (await fetch(`${base}/api/health`)).json();
   assert.equal(typeof health.configured, 'boolean');
   assert.equal(typeof health.remoteApi, 'boolean');
@@ -172,6 +184,30 @@ try {
   assert.equal(invalidIdsResponse.status, 400);
   const tasksAfterRejectedBulk = await (await fetch(`${base}/api/tasks`)).json();
   assert.equal(tasksAfterRejectedBulk.tasks.length, 3);
+  const lifecycleTaskResponse = await fetch(`${base}/api/tasks`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      profileId: 'lifecycle-profile',
+      videoPath: bulkVideoPath,
+      title: 'Lifecycle guard',
+      autoUpload: false,
+    }),
+  });
+  assert.equal(lifecycleTaskResponse.status, 201);
+  const lifecycleTask = await lifecycleTaskResponse.json();
+  const queuedUpload = await fetch(`${base}/api/tasks/${lifecycleTask.id}/upload`, { method: 'POST' });
+  assert.equal(queuedUpload.status, 409);
+  assert.equal((await queuedUpload.json()).code, 'invalid-task-state');
+  const cancelledLifecycleTask = await fetch(`${base}/api/tasks/${lifecycleTask.id}/cancel`, { method: 'POST' });
+  assert.equal(cancelledLifecycleTask.status, 200);
+  assert.equal((await cancelledLifecycleTask.json()).status, 'cancelled');
+  const cancelledRun = await fetch(`${base}/api/tasks/${lifecycleTask.id}/run`, { method: 'POST' });
+  assert.equal(cancelledRun.status, 409);
+  assert.equal((await cancelledRun.json()).code, 'invalid-task-state');
+  const cancelledLogin = await fetch(`${base}/api/tasks/${lifecycleTask.id}/prepare-login`, { method: 'POST' });
+  assert.equal(cancelledLogin.status, 409);
+  assert.equal((await cancelledLogin.json()).code, 'invalid-task-state');
   const proxies = await (await fetch(`${base}/api/proxies`)).json();
   assert.ok(Array.isArray(proxies.proxies));
   const importResult = await (await fetch(`${base}/api/proxies/import`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'http', text: '# test\n127.0.0.1:8080\ninvalid' }) })).json();
@@ -231,17 +267,128 @@ try {
   assert.equal(channelTask.status, 'queued');
   const channelTasks = await (await fetch(`${base}/api/channels/tasks`)).json();
   assert.equal(channelTasks.tasks.length, 1);
+  const bulkChannelResponse = await fetch(`${base}/api/channels/tasks/bulk`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      profileIds: ['channel-profile-a', ' channel-profile-b ', 'channel-profile-a'],
+      name: 'Channel {index} for {profileId}',
+      description: 'Description {index}: {profileId}',
+      avatarPath: channelAvatarPath,
+      links: [{ title: 'Website', url: 'https://example.com/channel' }],
+    }),
+  });
+  assert.equal(bulkChannelResponse.status, 201);
+  const bulkChannel = await bulkChannelResponse.json();
+  assert.equal(bulkChannel.created, 2);
+  assert.deepEqual(bulkChannel.profileIds, ['channel-profile-a', 'channel-profile-b']);
+  assert.equal(bulkChannel.autoRun, false);
+  assert.equal(bulkChannel.manualStartRequired, true);
+  assert.equal(bulkChannel.batch.total, 2);
+  assert.equal(bulkChannel.batch.queued, 2);
+  assert.ok(bulkChannel.tasks.every(task => task.source === 'bulk-channel' && task.batchId === bulkChannel.batchId && task.status === 'queued' && task.autoRun === false));
+  assert.deepEqual(bulkChannel.tasks.map(task => task.name), ['Channel 1 for channel-profile-a', 'Channel 2 for channel-profile-b']);
+  assert.deepEqual(bulkChannel.tasks.map(task => task.description), ['Description 1: channel-profile-a', 'Description 2: channel-profile-b']);
+  assert.ok(bulkChannel.tasks.every(task => task.avatarPath === path.resolve(channelAvatarPath)));
+  const channelBatches = await (await fetch(`${base}/api/channels/batches`)).json();
+  assert.equal(channelBatches.batches.length, 1);
+  assert.equal(channelBatches.batches[0].id, bulkChannel.batchId);
+  assert.equal(channelBatches.batches[0].total, 2);
+  const autoBulkChannelResponse = await fetch(`${base}/api/channels/tasks/bulk`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ profileIds: ['channel-profile-auto'], description: 'Automatic channel {index}', autoRun: true }),
+  });
+  assert.equal(autoBulkChannelResponse.status, 201);
+  const autoBulkChannel = await autoBulkChannelResponse.json();
+  assert.equal(autoBulkChannel.autoRun, true);
+  assert.equal(autoBulkChannel.manualStartRequired, false);
+  assert.equal(autoBulkChannel.tasks[0].status, 'queued');
+  const channelTaskCountBeforeRejectedBulk = (await (await fetch(`${base}/api/channels/tasks`)).json()).tasks.length;
+  const rejectedChannelBulk = await fetch(`${base}/api/channels/tasks/bulk`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      profileIds: Array.from({ length: 101 }, (_, index) => `channel-${index}`),
+      name: 'Over limit {index}',
+    }),
+  });
+  assert.equal(rejectedChannelBulk.status, 400);
+  const rejectedChannelLink = await fetch(`${base}/api/channels/tasks/bulk`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ profileIds: ['bad-link-profile'], links: [{ title: 'Bad', url: 'javascript:alert(1)' }] }),
+  });
+  assert.equal(rejectedChannelLink.status, 400);
+  const channelTasksAfterRejectedBulk = await (await fetch(`${base}/api/channels/tasks`)).json();
+  assert.equal(channelTasksAfterRejectedBulk.tasks.length, channelTaskCountBeforeRejectedBulk);
+  const recoveryStatePath = path.join(testStateDir, 'recovery-state.json');
+  fs.writeFileSync(recoveryStatePath, JSON.stringify({
+    channelTasks: [{
+      id: 'interrupted-channel-task',
+      profileId: 'recovery-profile',
+      name: 'Interrupted task',
+      status: 'applying',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    }],
+  }));
+  const recoveryProbe = `
+    import { once } from 'node:events';
+    const previousLog = console.log;
+    console.log = () => {};
+    const { server } = await import('./server.js?recovery-probe=1');
+    if (!server.listening) await once(server, 'listening');
+    const address = server.address();
+    const response = await fetch('http://127.0.0.1:' + address.port + '/api/channels/tasks');
+    const payload = await response.json();
+    await new Promise(resolve => server.close(resolve));
+    previousLog(JSON.stringify(payload.tasks));
+  `;
+  const recoveryProbeResult = await promisify(execFile)(process.execPath, ['--input-type=module', '--eval', recoveryProbe], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      PORT: '0',
+      CREATOR_FLOW_BACKGROUND: '0',
+      CREATOR_FLOW_STATE_PATH: recoveryStatePath,
+      CREATOR_FLOW_HOST: '127.0.0.1',
+    },
+  });
+  const recoveredChannelTasks = JSON.parse(recoveryProbeResult.stdout.trim());
+  assert.equal(recoveredChannelTasks.length, 1);
+  assert.equal(recoveredChannelTasks[0].status, 'recovery-needed');
+  assert.match(recoveredChannelTasks[0].message, /прервано перезапуском/i);
+  const invalidLibraryUpload = await fetch(`${base}/api/library/upload?name=broken.mp4`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/octet-stream' },
+    body: Buffer.from('not a media file'),
+  });
+  assert.equal(invalidLibraryUpload.status, 422);
+  const isolatedLibraryDir = path.join(testStateDir, 'library');
+  assert.deepEqual(fs.readdirSync(isolatedLibraryDir).filter(name => name.endsWith('.uploading')), []);
   const uniqueizer = await (await fetch(`${base}/api/uniqueizer/health`)).json();
   assert.equal(typeof uniqueizer.available, 'boolean');
   if (uniqueizer.available) {
     const execFileAsync = promisify(execFile);
     await execFileAsync(process.env.FFMPEG_PATH || 'ffmpeg', ['-y', '-f', 'lavfi', '-i', 'color=c=blue:s=160x90:d=0.2', '-c:v', 'libx264', inputPath]);
+    const streamedUpload = await fetch(`${base}/api/library/upload?name=streamed-input.mp4`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: fs.createReadStream(inputPath),
+      duplex: 'half',
+    });
+    assert.equal(streamedUpload.status, 201);
+    const streamedItem = (await streamedUpload.json()).item;
+    assert.equal(streamedItem.source, 'uploaded');
+    assert.equal(streamedItem.hasVideo, true);
+    assert.ok(fs.existsSync(streamedItem.filePath));
     const render = await (await fetch(`${base}/api/uniqueizer/render`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ inputPath, outputPath }) })).json();
     assert.equal(render.status, 'completed'); assert.ok(fs.existsSync(outputPath));
     const imported = await (await fetch(`${base}/api/library/import`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ filePath: outputPath }) })).json();
     assert.equal(imported.item.hasVideo, true);
     const library = await (await fetch(`${base}/api/library`)).json();
-    assert.equal(library.library.length, 1);
+    assert.equal(library.library.length, 2);
   }
   console.log('API smoke test passed');
 } finally {
@@ -251,6 +398,7 @@ try {
   fs.rmSync(inputPath, { force: true });
   fs.rmSync(outputPath, { force: true });
   fs.rmSync(bulkVideoPath, { force: true });
+  fs.rmSync(channelAvatarPath, { force: true });
   fs.rmSync(testStateDir, { recursive: true, force: true });
   if (productionHashBefore !== null) {
     const productionHashAfter = crypto.createHash('sha256').update(fs.readFileSync(productionStatePath)).digest('hex');

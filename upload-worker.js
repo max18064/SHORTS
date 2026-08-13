@@ -204,6 +204,9 @@ export async function uploadIntoSession({ session, videoPath, title, description
   ));
 
   const titleChanged = await fillFirst(page, titleFieldName, title, deadline, 'Название');
+  if (!titleChanged) {
+    throw new Error('YouTube Studio не показала поле названия ролика. Форма не считается подготовленной.');
+  }
   const descriptionChanged = await fillFirst(page, descriptionFieldName, description, deadline, 'Описание');
   const tagsChanged = tags.length
     ? await fillFirst(page, tagsFieldName, tags.join(', '), deadline, 'Теги')

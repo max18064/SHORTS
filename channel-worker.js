@@ -22,6 +22,9 @@ const descriptionFieldName = /(?:описание|description)/i;
 const channelNameSelector = '#channel-name, ytcp-channel-name, [id="channel-name"]';
 const channelAvatarSelector = 'ytcp-avatar img, ytcp-channel-avatar img, img[src*="yt3.ggpht.com"], img#img';
 const fileInputSelector = 'input[type="file"]';
+const customizationHrefSelector = 'a[href*="/customization"], a[href*="/editing"], [role="link"][href*="/customization"], [role="link"][href*="/editing"]';
+const brandingHrefSelector = 'a[href*="branding"], [role="link"][href*="branding"]';
+const basicInfoHrefSelector = 'a[href*="basic"], a[href*="info"], [role="link"][href*="basic"], [role="link"][href*="info"]';
 
 function operationTimeout(value) {
   const parsed = Number.parseInt(value ?? process.env.CREATOR_FLOW_BROWSER_OPERATION_TIMEOUT_MS, 10);
@@ -143,6 +146,82 @@ async function clickFirst(page, pattern, deadline, stage) {
   return true;
 }
 
+async function clickVisibleLocator(locator, deadline, stage) {
+  const item = await firstVisible(locator, deadline, stage);
+  if (!item) return false;
+  await withinDeadline(deadline, `${stage}: клик`, () => (
+    item.click({ timeout: stepTimeout(deadline, `${stage}: клик`) })
+  ));
+  return true;
+}
+
+async function settleStudioPage(page, deadline, stage) {
+  await withinDeadline(deadline, stage, () => (
+    page.waitForTimeout(Math.min(600, deadline.remaining(stage)))
+  ));
+}
+
+function customizationUrlFromCurrentPage(currentUrl) {
+  try {
+    const url = new URL(currentUrl);
+    const match = url.pathname.match(/\/channel\/([^/?#]+)/i);
+    if (!match) return '';
+    return `${url.origin}/channel/${encodeURIComponent(match[1])}/editing`;
+  } catch {
+    return '';
+  }
+}
+
+function isCustomizationPage(currentUrl) {
+  return /\/(?:customization|editing)(?:[/?#]|$)/i.test(String(currentUrl || ''));
+}
+
+async function openStudioSection(page, { text, hrefSelector, stage }, deadline) {
+  if (hrefSelector && await clickVisibleLocator(page.locator(hrefSelector), deadline, `${stage}: ссылка`)) {
+    await settleStudioPage(page, deadline, `${stage}: ожидание`);
+    return true;
+  }
+  if (await clickVisibleLocator(page.getByRole('link', { name: text }), deadline, `${stage}: пункт меню`)) {
+    await settleStudioPage(page, deadline, `${stage}: ожидание`);
+    return true;
+  }
+  if (await clickFirst(page, text, deadline, stage)) {
+    await settleStudioPage(page, deadline, `${stage}: ожидание`);
+    return true;
+  }
+  return false;
+}
+
+async function openChannelCustomization(page, deadline) {
+  if (isCustomizationPage(page.url())) return true;
+
+  // Recent Studio versions expose a direct /editing or /customization link.
+  // Prefer it over matching rendered text, because the navigation label can
+  // vary by language and the side menu can be collapsed.
+  if (await clickVisibleLocator(page.locator(customizationHrefSelector), deadline, 'Открытие настройки канала: ссылка')) {
+    await settleStudioPage(page, deadline, 'Ожидание настройки канала');
+    if (isCustomizationPage(page.url())) return true;
+  }
+
+  const directUrl = customizationUrlFromCurrentPage(page.url());
+  if (directUrl) {
+    await withinDeadline(deadline, 'Переход к настройке канала', () => (
+      page.goto(directUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: stepTimeout(deadline, 'Переход к настройке канала'),
+      })
+    )).catch(() => {});
+    await settleStudioPage(page, deadline, 'Ожидание настройки канала');
+    if (isCustomizationPage(page.url())) return true;
+  }
+
+  return openStudioSection(page, {
+    text: customizationText,
+    hrefSelector: customizationHrefSelector,
+    stage: 'Открытие настройки канала',
+  }, deadline);
+}
+
 async function fillByLabel(page, pattern, value, deadline, stage) {
   if (!value) return false;
   // `value` comes from the explicit task and is only written to a form field;
@@ -216,47 +295,66 @@ export async function updateChannelBranding({
   operationTimeoutMs,
 } = {}) {
   return withStudio(wsEndpoint, async (page, deadline) => {
-    const opened = await clickFirst(page, customizationText, deadline, 'Открытие настройки канала');
+    const opened = await openChannelCustomization(page, deadline);
+    if (loginUrl.test(page.url())) return { status: 'manual-login-required', url: page.url() };
     if (!opened) {
-      throw new Error('В YouTube Studio не найдена страница «Настройка канала».');
+      throw new Error('В YouTube Studio не удалось открыть настройку канала. Проверьте, что выбран именно канал, а не страница с правами доступа.');
     }
-    await withinDeadline(deadline, 'Ожидание настройки канала', () => (
-      page.waitForTimeout(Math.min(700, deadline.remaining('Ожидание настройки канала')))
-    ));
+    await settleStudioPage(page, deadline, 'Ожидание формы настройки канала');
 
-    const nameChanged = await fillByLabel(page, nameFieldName, name, deadline, 'Название канала');
-    const descriptionChanged = await fillByLabel(page, descriptionFieldName, description, deadline, 'Описание канала');
     const normalizedLinks = Array.isArray(links)
       ? links.filter(link => link?.title && link?.url)
       : [];
+    let nameChanged = false;
+    let descriptionChanged = false;
+
+    // Channel name, description and external links live in the Basic info
+    // section in current Studio. Enter it before attempting to fill fields;
+    // otherwise a hidden dashboard control could make a task look complete.
+    if (name || description || normalizedLinks.length) {
+      const basicInfoOpened = await openStudioSection(page, {
+        text: basicInfoText,
+        hrefSelector: basicInfoHrefSelector,
+        stage: 'Открытие основных сведений',
+      }, deadline);
+      if (!basicInfoOpened) throw new Error('В YouTube Studio не найдена вкладка «Основные сведения».');
+      nameChanged = await fillByLabel(page, nameFieldName, name, deadline, 'Название канала');
+      descriptionChanged = await fillByLabel(page, descriptionFieldName, description, deadline, 'Описание канала');
+      if (name && !nameChanged) throw new Error('YouTube Studio не показала поле названия канала. Изменение не сохранено.');
+      if (description && !descriptionChanged) throw new Error('YouTube Studio не показала поле описания канала. Изменение не сохранено.');
+    }
 
     if (avatarPath || bannerPath) {
-      const brandingOpened = await clickFirst(page, brandingText, deadline, 'Открытие вкладки брендинга');
+      const brandingOpened = await openStudioSection(page, {
+        text: brandingText,
+        hrefSelector: brandingHrefSelector,
+        stage: 'Открытие вкладки брендинга',
+      }, deadline);
       if (!brandingOpened) throw new Error('В YouTube Studio не найдена вкладка «Брендинг».');
-      await withinDeadline(deadline, 'Ожидание вкладки брендинга', () => (
-        page.waitForTimeout(Math.min(400, deadline.remaining('Ожидание вкладки брендинга')))
-      ));
+      await settleStudioPage(page, deadline, 'Ожидание вкладки брендинга');
 
       const inputs = page.locator(fileInputSelector);
       const inputCount = await withinDeadline(deadline, 'Поиск полей файлов брендинга', () => inputs.count());
       // File paths are direct form values, not parts of a selector.
-      if (avatarPath && inputCount >= 1) {
+      if (avatarPath && inputCount < 1) throw new Error('YouTube Studio не показала поле выбора аватара. Изменение не сохранено.');
+      if (bannerPath && inputCount < 2) throw new Error('YouTube Studio не показала поле выбора баннера. Изменение не сохранено.');
+      if (avatarPath) {
         await withinDeadline(deadline, 'Выбор аватара канала', () => inputs.nth(0).setInputFiles(avatarPath));
       }
-      if (bannerPath && inputCount >= 2) {
+      if (bannerPath) {
         await withinDeadline(deadline, 'Выбор баннера канала', () => inputs.nth(1).setInputFiles(bannerPath));
       }
     }
 
     let linksAdded = 0;
     if (normalizedLinks.length) {
-      const basicInfoOpened = await clickFirst(page, basicInfoText, deadline, 'Открытие основных сведений');
-      if (!basicInfoOpened) throw new Error('В YouTube Studio не найдена вкладка «Основные сведения».');
       for (const link of normalizedLinks) {
-        if (!await clickFirst(page, addLinkText, deadline, 'Добавление ссылки')) break;
+        if (!await clickFirst(page, addLinkText, deadline, 'Добавление ссылки')) {
+          throw new Error('YouTube Studio не показала кнопку добавления ссылки. Изменение не сохранено.');
+        }
         const fields = page.getByRole('textbox');
         const count = await withinDeadline(deadline, 'Поиск полей ссылки', () => fields.count());
-        if (count < 2) continue;
+        if (count < 2) throw new Error('YouTube Studio не показала поля для новой ссылки. Изменение не сохранено.');
         await withinDeadline(deadline, 'Заполнение названия ссылки', () => (
           fields.nth(count - 2).fill(link.title, { timeout: stepTimeout(deadline, 'Заполнение названия ссылки') })
         ));
@@ -265,6 +363,7 @@ export async function updateChannelBranding({
         ));
         linksAdded += 1;
       }
+      if (linksAdded !== normalizedLinks.length) throw new Error('Не все ссылки были добавлены в YouTube Studio. Изменение не сохранено.');
     }
 
     const publish = await firstVisible(page.getByRole('button', { name: publishButtonName }), deadline, 'Поиск сохранения оформления');

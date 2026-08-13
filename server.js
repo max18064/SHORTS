@@ -43,6 +43,7 @@ const lockedManualProfiles = new Map();
 let schedulerRunning = false;
 let studioBatchPumpRunning = false;
 let accountCheckBatchPumpRunning = false;
+let channelTaskPumpRunning = false;
 const execFileAsync = promisify(execFile);
 const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
 const ffprobeBin = process.env.FFPROBE_PATH || (path.basename(ffmpegBin).toLowerCase().startsWith('ffmpeg') ? path.join(path.dirname(ffmpegBin), process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe') : 'ffprobe');
@@ -98,6 +99,15 @@ for (const task of tasks) {
   } else if (['uploading', 'starting-profile'].includes(task.status)) {
     task.status = 'recovery-needed';
     task.message = 'Работа была прервана перезапуском. Проверьте результат в YouTube Studio, прежде чем создавать новую задачу.';
+    task.updatedAt = new Date().toISOString();
+    stateNeedsCleanup = true;
+  }
+}
+for (const task of channelTasks) {
+  if (!task || typeof task !== 'object') continue;
+  if (['starting-profile', 'applying'].includes(task.status)) {
+    task.status = 'recovery-needed';
+    task.message = 'Оформление канала было прервано перезапуском. Проверьте результат в YouTube Studio и запустите задачу повторно только при необходимости.';
     task.updatedAt = new Date().toISOString();
     stateNeedsCleanup = true;
   }
@@ -298,6 +308,16 @@ function publicTask(task) {
   const { wsEndpoint, profileResult, ...safe } = task;
   return safe;
 }
+function rejectTaskState(res, task, allowedStates, action) {
+  if (allowedStates.includes(task.status)) return false;
+  res.status(409).json({
+    error: `Действие «${action}» недоступно для задачи в статусе «${task.status || 'неизвестно'}».`,
+    code: 'invalid-task-state',
+    task: publicTask(task),
+    worker: workerState(),
+  });
+  return true;
+}
 function sessionEndpoint(value) {
   return typeof value === 'string' ? value : value?.wsEndpoint;
 }
@@ -339,6 +359,9 @@ async function automationEndpointAvailable(endpoint) {
   }
 }
 async function discoverRunningProfileEndpoint(profileId) {
+  // Smoke tests use an isolated state file. They must never inspect or attach
+  // to a real, already-open Dolphin browser on the workstation.
+  if (isolatedState || process.env.CREATOR_FLOW_DISCOVER_RUNNING_PROFILES === '0') return null;
   if (process.platform !== 'win32') return null;
   const script = [
     "$id = $env:CREATOR_FLOW_PROFILE_ID;",
@@ -444,6 +467,128 @@ function safeFileName(value) {
   const normalized = base.replace(/[^\p{L}\p{N}._ -]/gu, '_').replace(/^\.+/, '');
   return normalized || 'video.mp4';
 }
+const LIBRARY_UPLOAD_MAX_BYTES = 750 * 1024 * 1024;
+const libraryUploadExtensions = new Set(['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v']);
+function libraryUploadError(message, statusCode, code) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.code = code;
+  return error;
+}
+function requestContentLength(request) {
+  const raw = request.headers['content-length'];
+  if (Array.isArray(raw) || typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : null;
+}
+function isOctetStreamRequest(request) {
+  const raw = request.headers['content-type'];
+  if (Array.isArray(raw) || typeof raw !== 'string') return false;
+  return raw.split(';', 1)[0].trim().toLowerCase() === 'application/octet-stream';
+}
+function drainUploadRequest(request) {
+  // Keep the connection reusable after an early validation failure without
+  // accumulating the request body in memory.
+  request.resume();
+}
+function waitForWritableDrain(stream) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      stream.removeListener('drain', onDrain);
+      stream.removeListener('error', onError);
+      stream.removeListener('close', onClose);
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const onDrain = () => finish(resolve);
+    const onError = error => finish(reject, error);
+    const onClose = () => finish(reject, new Error('Временный файл загрузки был закрыт до записи.'));
+    stream.once('drain', onDrain);
+    stream.once('error', onError);
+    stream.once('close', onClose);
+  });
+}
+function finishWritable(stream) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let finished = false;
+    const cleanup = () => {
+      stream.removeListener('finish', onFinish);
+      stream.removeListener('error', onError);
+      stream.removeListener('close', onClose);
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const onFinish = () => {
+      finished = true;
+      if (stream.closed) finish(resolve);
+    };
+    const onError = error => finish(reject, error);
+    const onClose = () => finished
+      ? finish(resolve)
+      : finish(reject, new Error('Временный файл загрузки был закрыт до завершения записи.'));
+    stream.once('finish', onFinish);
+    stream.once('error', onError);
+    stream.once('close', onClose);
+    stream.end();
+  });
+}
+function closeWritable(stream) {
+  if (!stream || stream.closed) return Promise.resolve();
+  return new Promise(resolve => {
+    stream.once('close', resolve);
+    if (!stream.destroyed) stream.destroy();
+  });
+}
+async function streamLibraryUpload(request, tempPath) {
+  const declaredLength = requestContentLength(request);
+  if (declaredLength !== null && declaredLength > LIBRARY_UPLOAD_MAX_BYTES) {
+    drainUploadRequest(request);
+    throw libraryUploadError('Размер файла не должен превышать 750 МБ.', 413, 'library-upload-too-large');
+  }
+  if (declaredLength === 0) {
+    drainUploadRequest(request);
+    throw libraryUploadError('Файл не получен.', 400, 'library-upload-empty');
+  }
+
+  const output = fs.createWriteStream(tempPath, { flags: 'wx', mode: 0o600 });
+  let outputError = null;
+  output.on('error', error => { outputError ||= error; });
+  let receivedBytes = 0;
+  // Node's iterator keeps the request streaming and, with this option, allows
+  // us to drain an over-limit request rather than buffering or destroying it.
+  const input = typeof request.iterator === 'function'
+    ? request.iterator({ destroyOnReturn: false })
+    : request;
+  try {
+    for await (const rawChunk of input) {
+      if (outputError) throw outputError;
+      const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+      if (receivedBytes + chunk.length > LIBRARY_UPLOAD_MAX_BYTES) {
+        throw libraryUploadError('Размер файла не должен превышать 750 МБ.', 413, 'library-upload-too-large');
+      }
+      receivedBytes += chunk.length;
+      if (!output.write(chunk)) await waitForWritableDrain(output);
+    }
+    if (outputError) throw outputError;
+    if (receivedBytes === 0) throw libraryUploadError('Файл не получен.', 400, 'library-upload-empty');
+    await finishWritable(output);
+    return receivedBytes;
+  } catch (error) {
+    drainUploadRequest(request);
+    await closeWritable(output);
+    throw error;
+  }
+}
 const MAX_BULK_UPLOAD_TASKS = 100;
 function normalizeBulkProfileIds(rawIds) {
   if (!Array.isArray(rawIds)) return { error: 'profileIds must be an array.' };
@@ -486,6 +631,77 @@ function fillBulkTitleTemplate(titleTemplate, profileId, index) {
   return titleTemplate
     .replaceAll('{index}', String(index))
     .replaceAll('{profileId}', profileId);
+}
+const MAX_BULK_CHANNEL_TASKS = 100;
+const MAX_CHANNEL_LINKS = 20;
+function hasUnsafeTextControl(value) {
+  return /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value);
+}
+function normalizeChannelTemplate(value, label, maxLength) {
+  if (value === undefined || value === null) return '';
+  if (typeof value !== 'string') throw validationError(`${label} должно быть строкой.`);
+  const text = value.trim();
+  if (text.length > maxLength || hasUnsafeTextControl(text)) {
+    throw validationError(`${label} содержит недопустимые символы или превышает лимит ${maxLength} символов.`);
+  }
+  return text;
+}
+function normalizeChannelLinks(rawLinks) {
+  if (rawLinks === undefined || rawLinks === null) return [];
+  if (!Array.isArray(rawLinks)) throw validationError('Ссылки должны быть списком.');
+  if (rawLinks.length > MAX_CHANNEL_LINKS) throw validationError(`Для задачи доступно не более ${MAX_CHANNEL_LINKS} ссылок.`);
+  return rawLinks.map((link, index) => {
+    if (!isObjectRecord(link)) throw validationError(`Ссылка ${index + 1} указана неверно.`);
+    const title = normalizeChannelTemplate(link.title, `Название ссылки ${index + 1}`, 100);
+    const rawUrl = normalizeChannelTemplate(link.url, `URL ссылки ${index + 1}`, 2_048);
+    if (!title || !rawUrl) throw validationError(`Заполните название и URL для ссылки ${index + 1}.`);
+    let url;
+    try { url = new URL(rawUrl); } catch { throw validationError(`URL ссылки ${index + 1} указан неверно.`); }
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+      throw validationError(`URL ссылки ${index + 1} должен быть HTTP или HTTPS адресом без данных входа.`);
+    }
+    return { title, url: url.toString() };
+  });
+}
+function normalizeChannelAssetPath(value, label) {
+  if (value === undefined || value === null || value === '') return '';
+  if (typeof value !== 'string') throw validationError(`${label} должен быть путём к файлу.`);
+  const rawPath = value.trim();
+  if (!rawPath || rawPath.length > 4_096 || rawPath.includes('\0')) {
+    throw validationError(`${label} указан неверно.`);
+  }
+  const filePath = path.resolve(rawPath);
+  try {
+    if (!fs.statSync(filePath).isFile()) throw new Error('not-a-file');
+  } catch {
+    throw validationError(`${label} не найден по указанному пути.`);
+  }
+  return filePath;
+}
+function summarizeChannelBatchTasks(batchTasks) {
+  const summary = { total: batchTasks.length, queued: 0, running: 0, completed: 0, manualLoginRequired: 0, error: 0, cancelled: 0 };
+  for (const task of batchTasks) {
+    if (task.status === 'queued') summary.queued += 1;
+    else if (['starting-profile', 'applying'].includes(task.status)) summary.running += 1;
+    else if (task.status === 'completed') summary.completed += 1;
+    else if (task.status === 'manual-login-required') summary.manualLoginRequired += 1;
+    else if (task.status === 'cancelled') summary.cancelled += 1;
+    else if (task.status === 'error') summary.error += 1;
+  }
+  return summary;
+}
+function publicChannelBatch(batchId, batchTasks) {
+  const summary = summarizeChannelBatchTasks(batchTasks);
+  const createdAt = batchTasks.reduce((earliest, task) => !earliest || String(task.createdAt || '') < earliest ? String(task.createdAt || '') : earliest, '');
+  const updatedAt = batchTasks.reduce((latest, task) => String(task.updatedAt || task.createdAt || '') > latest ? String(task.updatedAt || task.createdAt || '') : latest, '');
+  return {
+    id: batchId,
+    source: 'bulk-channel',
+    createdAt,
+    updatedAt,
+    autoRun: batchTasks.some(task => task.autoRun === true),
+    ...summary,
+  };
 }
 function workerState() {
   const occupiedProfiles = workerOccupiedProfiles();
@@ -577,6 +793,7 @@ function queueProfileOperation({ key, profileId, work, allowManualSessionTaskId 
           processScheduledTasks().catch(error => addLog(`Ошибка планировщика: ${error.message}`, null, 'error'));
           processStudioSyncBatches().catch(error => addLog(`Ошибка очереди пакетной синхронизации: ${error.message}`, null, 'error'));
           processAccountCheckBatches().catch(error => addLog(`Ошибка очереди проверки аккаунтов: ${error.message}`, null, 'error'));
+          processScheduledChannelTasks().catch(error => addLog(`Ошибка очереди оформления каналов: ${error.message}`, null, 'error'));
         });
       }
     }
@@ -651,13 +868,25 @@ const scheduler = setInterval(() => {
   processScheduledTasks().catch(error => addLog(`Ошибка планировщика: ${error.message}`, null, 'error'));
   processStudioSyncBatches().catch(error => addLog(`Ошибка очереди пакетной синхронизации: ${error.message}`, null, 'error'));
   processAccountCheckBatches().catch(error => addLog(`Ошибка очереди проверки аккаунтов: ${error.message}`, null, 'error'));
+  processScheduledChannelTasks().catch(error => addLog(`Ошибка очереди оформления каналов: ${error.message}`, null, 'error'));
 }, 5000);
 scheduler.unref();
 const manualSessionJanitor = setInterval(() => { expireManualSessions().catch(error => addLog(`Ошибка очистки ручных сессий: ${error.message}`, null, 'error')); }, 60_000);
 manualSessionJanitor.unref();
 
 app.use(express.json());
-app.use(express.static(root));
+// The control panel is deliberately local-only.  Serving the project root
+// would also expose local library files and implementation sources, so expose
+// only the two browser assets the UI needs.
+app.get(['/', '/index.html'], (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.sendFile(path.join(root, 'index.html'));
+});
+app.get('/client.js', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.type('application/javascript');
+  res.sendFile(path.join(root, 'client.js'));
+});
 
 async function dolphin(pathname, options = {}) {
   if (!token) throw new Error('DOLPHIN_API_TOKEN не настроен локально');
@@ -1128,6 +1357,7 @@ app.patch('/api/settings', (req, res) => {
       processScheduledTasks().catch(error => addLog(`Ошибка планировщика: ${error.message}`, null, 'error'));
       processStudioSyncBatches().catch(error => addLog(`Ошибка очереди пакетной синхронизации: ${error.message}`, null, 'error'));
       processAccountCheckBatches().catch(error => addLog(`Ошибка очереди проверки аккаунтов: ${error.message}`, null, 'error'));
+      processScheduledChannelTasks().catch(error => addLog(`Ошибка очереди оформления каналов: ${error.message}`, null, 'error'));
     }
   }
   res.json({ settings: { ...settings }, worker: workerState() });
@@ -1197,6 +1427,20 @@ app.post('/api/studio/sync-batches', (req, res) => {
   res.status(202).json({ batch: publicStudioBatch(batch), worker: workerState() });
 });
 app.get('/api/channels/tasks', (_req, res) => res.json({ tasks: channelTasks }));
+app.get('/api/channels/batches', (_req, res) => {
+  const grouped = new Map();
+  for (const task of channelTasks) {
+    if (task?.source !== 'bulk-channel' || !task?.batchId) continue;
+    const batchId = String(task.batchId);
+    const items = grouped.get(batchId) || [];
+    items.push(task);
+    grouped.set(batchId, items);
+  }
+  const batches = [...grouped.entries()]
+    .map(([batchId, items]) => publicChannelBatch(batchId, items))
+    .sort((left, right) => Date.parse(right.createdAt || 0) - Date.parse(left.createdAt || 0));
+  res.json({ batches: batches.slice(0, 50) });
+});
 app.get('/api/videos/stats', (_req, res) => {
   const stats = videos.reduce((acc, video) => ({ count: acc.count + 1, views: acc.views + Number(video.views || 0), likes: acc.likes + Number(video.likes || 0), comments: acc.comments + Number(video.comments || 0), zeroViews: acc.zeroViews + (Number(video.views || 0) === 0 ? 1 : 0), over300: acc.over300 + (Number(video.views || 0) >= 300 ? 1 : 0), unavailable: acc.unavailable + (video.status === 'unavailable' ? 1 : 0) }), { count: 0, views: 0, likes: 0, comments: 0, zeroViews: 0, over300: 0, unavailable: 0 });
   res.json(stats);
@@ -1227,21 +1471,54 @@ app.post('/api/library/import', async (req, res) => {
   } catch (error) { res.status(422).json({ error: error.message }); }
 });
 
-app.post('/api/library/upload', express.raw({ type: 'application/octet-stream', limit: '750mb' }), async (req, res) => {
+app.post('/api/library/upload', async (req, res) => {
   const originalName = safeFileName(req.query.name || req.headers['x-file-name']);
-  if (!Buffer.isBuffer(req.body) || req.body.length === 0) return res.status(400).json({ error: 'Файл не получен.' });
-  const extension = path.extname(originalName).toLowerCase();
-  if (!['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v'].includes(extension)) return res.status(415).json({ error: 'Поддерживаются видеофайлы MP4, MOV, MKV, WebM, AVI и M4V.' });
-  const targetPath = path.join(libraryDir, `${crypto.randomUUID()}-${originalName}`);
-  try {
-    fs.writeFileSync(targetPath, req.body);
-    const metadata = await inspectMediaFile(targetPath, { ffprobeBin });
-    const item = makeLibraryEntry(metadata, 'uploaded');
-    library.unshift(item); saveState(); addLog(`Файл скопирован в библиотеку: ${item.fileName}`); res.status(201).json({ item });
-  } catch (error) {
-    fs.rmSync(targetPath, { force: true });
-    res.status(422).json({ error: error.message });
+  if (!isOctetStreamRequest(req)) {
+    drainUploadRequest(req);
+    return res.status(400).json({ error: 'Файл не получен.' });
   }
+  const extension = path.extname(originalName).toLowerCase();
+  if (!libraryUploadExtensions.has(extension)) {
+    drainUploadRequest(req);
+    return res.status(415).json({ error: 'Поддерживаются видеофайлы MP4, MOV, MKV, WebM, AVI и M4V.' });
+  }
+  const targetPath = path.join(libraryDir, `${crypto.randomUUID()}-${originalName}`);
+  const tempPath = `${targetPath}.uploading`;
+  let finalized = false;
+  let libraryItem = null;
+  let uploadError = null;
+  try {
+    await streamLibraryUpload(req, tempPath);
+    const inspected = await inspectMediaFile(tempPath, { ffprobeBin });
+    // Both files are in the library directory, so the rename is atomic. A
+    // completed entry is never visible under its final name before ffprobe
+    // has accepted the streamed upload.
+    await fs.promises.rename(tempPath, targetPath);
+    finalized = true;
+    const metadata = { ...inspected, filePath: targetPath, fileName: path.basename(targetPath) };
+    libraryItem = makeLibraryEntry(metadata, 'uploaded');
+    library.unshift(libraryItem);
+    saveState();
+    addLog(`Файл скопирован в библиотеку: ${libraryItem.fileName}`);
+  } catch (error) {
+    if (libraryItem) {
+      const index = library.findIndex(item => item.id === libraryItem.id);
+      if (index >= 0) library.splice(index, 1);
+    }
+    uploadError = error;
+  } finally {
+    // Clean up a partially written file, failed validation, failed rename, or
+    // a final file whose state entry could not be committed.
+    if (!finalized || libraryItem === null) {
+      await fs.promises.rm(tempPath, { force: true }).catch(() => {});
+      await fs.promises.rm(targetPath, { force: true }).catch(() => {});
+    }
+  }
+  if (uploadError) {
+    const statusCode = Number.isInteger(uploadError?.statusCode) ? uploadError.statusCode : 422;
+    return res.status(statusCode).json({ error: uploadError.message });
+  }
+  return res.status(201).json({ item: libraryItem });
 });
 
 app.delete('/api/library/:id', (req, res) => {
@@ -1268,6 +1545,7 @@ app.post('/api/proxies/import', (req, res) => {
 app.post('/api/tasks/:id/run', async (req, res) => {
   const task = tasks.find(item => item.id === req.params.id);
   if (!task) return res.status(404).json({ error: 'Задача не найдена' });
+  if (rejectTaskState(res, task, ['queued'], 'Запуск')) return;
   if (task.manualSessionOpen) return res.status(409).json({ error: 'Для открытой ручной сессии используйте «Проверить вход».', code: 'manual-session-open', worker: workerState() });
   const operation = queueUploadTask(task);
   if (!operation.started) return res.status(409).json({ error: operation.message, code: operation.code, worker: workerState() });
@@ -1278,6 +1556,7 @@ app.post('/api/tasks/:id/run', async (req, res) => {
 app.post('/api/tasks/:id/upload', async (req, res) => {
   const task = tasks.find(item => item.id === req.params.id);
   if (!task) return res.status(404).json({ error: 'Задача не найдена' });
+  if (rejectTaskState(res, task, ['profile-ready'], 'Загрузка')) return;
   if (task.manualSessionOpen) return res.status(409).json({ error: 'Для открытой ручной сессии используйте «Проверить вход».', code: 'manual-session-open', worker: workerState() });
   const operation = queueUploadTask(task, { uploadOnly: true });
   if (!operation.started) return res.status(409).json({ error: operation.message, code: operation.code, worker: workerState() });
@@ -1288,6 +1567,8 @@ app.post('/api/tasks/:id/upload', async (req, res) => {
 app.post('/api/tasks/:id/prepare-login', async (req, res) => {
   const task = tasks.find(item => item.id === req.params.id);
   if (!task) return res.status(404).json({ error: 'Задача не найдена' });
+  if (task.manualSessionOpen) return res.status(409).json({ error: 'Сессия ручного входа уже открыта. Завершите вход и нажмите «Проверить вход».', code: 'manual-session-open', worker: workerState() });
+  if (rejectTaskState(res, task, ['queued', 'profile-ready', 'manual-login-required', 'login-ready'], 'Открытие входа')) return;
   const operation = queueProfileOperation({
     key: `login:${task.id}`,
     profileId: task.profileId,
@@ -1359,6 +1640,7 @@ async function continueManualTaskUpload(task) {
 app.post('/api/tasks/:id/upload/continue', async (req, res) => {
   const task = tasks.find(item => item.id === req.params.id);
   if (!task || !uploadSessions.has(task.id)) return res.status(404).json({ error: 'Сессия ручного входа не найдена' });
+  if (rejectTaskState(res, task, ['manual-login-required', 'login-ready'], 'Проверка входа')) return;
   const operation = queueProfileOperation({
     key: `continue:${task.id}`,
     profileId: task.profileId,
@@ -1479,6 +1761,7 @@ app.post('/api/tasks', (req, res) => {
 app.post('/api/tasks/:id/cancel', async (req, res) => {
   const task = tasks.find(item => item.id === req.params.id);
   if (!task) return res.status(404).json({ error: 'Задача не найдена' });
+  if (rejectTaskState(res, task, ['queued', 'scheduled', 'profile-ready', 'manual-login-required', 'login-ready', 'recovery-needed'], 'Отмена')) return;
   if (activeOperationForTask(task.id)) {
     return res.status(409).json({ error: 'Задача сейчас выполняется. Дождитесь завершения операции, затем отмените её.', code: 'task-busy', worker: workerState() });
   }
@@ -1486,6 +1769,93 @@ app.post('/api/tasks/:id/cancel', async (req, res) => {
   task.status = 'cancelled'; task.updatedAt = new Date().toISOString();
   saveState();
   res.json(publicTask(task));
+});
+
+app.post('/api/channels/tasks/bulk', (req, res) => {
+  const profileResult = normalizeBulkProfileIds(req.body?.profileIds);
+  if (profileResult.error) return res.status(400).json({ error: profileResult.error });
+  if (profileResult.profileIds.length > MAX_BULK_CHANNEL_TASKS) {
+    return res.status(400).json({ error: `За один пакет можно добавить не более ${MAX_BULK_CHANNEL_TASKS} профилей.` });
+  }
+
+  let nameTemplate;
+  let descriptionTemplate;
+  let links;
+  let avatarPath;
+  let bannerPath;
+  try {
+    nameTemplate = normalizeChannelTemplate(req.body?.name, 'Название канала', 100);
+    descriptionTemplate = normalizeChannelTemplate(req.body?.description, 'Описание канала', 5_000);
+    links = normalizeChannelLinks(req.body?.links);
+    avatarPath = normalizeChannelAssetPath(req.body?.avatarPath, 'Аватар канала');
+    bannerPath = normalizeChannelAssetPath(req.body?.bannerPath, 'Баннер канала');
+  } catch (error) {
+    return res.status(error?.statusCode || 400).json({ error: error.message });
+  }
+  if (!nameTemplate && !descriptionTemplate && !links.length && !avatarPath && !bannerPath) {
+    return res.status(400).json({ error: 'Укажите хотя бы одно изменение оформления канала.' });
+  }
+  if (req.body?.autoRun !== undefined && typeof req.body.autoRun !== 'boolean') {
+    return res.status(400).json({ error: 'autoRun должен быть логическим значением.' });
+  }
+  const autoRun = req.body?.autoRun === true;
+
+  const expanded = [];
+  for (const [offset, profileId] of profileResult.profileIds.entries()) {
+    const index = offset + 1;
+    const name = fillBulkTitleTemplate(nameTemplate, profileId, index).trim();
+    const description = fillBulkTitleTemplate(descriptionTemplate, profileId, index).trim();
+    if (name.length > 100 || hasUnsafeTextControl(name)) {
+      return res.status(400).json({ error: `Название для профиля ${profileId} превышает лимит или содержит недопустимые символы.` });
+    }
+    if (description.length > 5_000 || hasUnsafeTextControl(description)) {
+      return res.status(400).json({ error: `Описание для профиля ${profileId} превышает лимит или содержит недопустимые символы.` });
+    }
+    if (!name && !description && !links.length && !avatarPath && !bannerPath) {
+      return res.status(400).json({ error: `Для профиля ${profileId} не осталось изменений оформления.` });
+    }
+    expanded.push({ profileId, name, description });
+  }
+
+  const batchId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const created = expanded.map(({ profileId, name, description }) => ({
+    id: crypto.randomUUID(),
+    profileId,
+    name,
+    description,
+    links: links.map(link => ({ ...link })),
+    avatarPath,
+    bannerPath,
+    autoRun,
+    source: 'bulk-channel',
+    batchId,
+    status: 'queued',
+    createdAt: now,
+    updatedAt: now,
+  }));
+
+  try {
+    channelTasks.unshift(...created);
+    saveState();
+  } catch (error) {
+    channelTasks.splice(0, created.length);
+    return res.status(500).json({ error: `Пакет оформления не сохранён: ${error.message}` });
+  }
+  addLog(`Создан пакет оформления каналов: ${created.length} профилей.`, batchId);
+  if (backgroundEnabled && autoRun) {
+    queueMicrotask(() => processScheduledChannelTasks().catch(error => addLog(`Ошибка автоматического запуска оформления: ${error.message}`, batchId, 'error')));
+  }
+  res.status(201).json({
+    batchId,
+    created: created.length,
+    profileIds: profileResult.profileIds,
+    autoRun,
+    manualStartRequired: !autoRun,
+    tasks: created,
+    batch: publicChannelBatch(batchId, created),
+    worker: workerState(),
+  });
 });
 
 app.post('/api/channels/tasks', (req, res) => {
@@ -1521,9 +1891,31 @@ function queueChannelTask(task) {
   });
 }
 
+async function processScheduledChannelTasks() {
+  if (channelTaskPumpRunning) return;
+  channelTaskPumpRunning = true;
+  try {
+    const dueTasks = channelTasks
+      .filter(task => task.status === 'queued' && task.autoRun === true)
+      .sort((left, right) => Date.parse(left.createdAt || 0) - Date.parse(right.createdAt || 0));
+    for (const task of dueTasks) {
+      if (workerOccupiedProfiles().size >= settings.maxConcurrentTasks) break;
+      const operation = queueChannelTask(task);
+      if (operation.started) {
+        operation.promise.catch(error => addLog(`Ошибка пакетного оформления канала: ${error.message}`, task.id, 'error'));
+      }
+    }
+  } finally {
+    channelTaskPumpRunning = false;
+  }
+}
+
 app.post('/api/channels/tasks/:id/run', async (req, res) => {
   const task = channelTasks.find(item => item.id === req.params.id);
   if (!task) return res.status(404).json({ error: 'Задача оформления канала не найдена' });
+  if (!['queued', 'error', 'recovery-needed', 'manual-login-required'].includes(task.status)) {
+    return res.status(409).json({ error: 'Эту задачу нельзя запустить в текущем статусе.', task });
+  }
   const operation = queueChannelTask(task);
   if (!operation.started) return res.status(409).json({ error: operation.message, code: operation.code, worker: workerState() });
   await operation.promise;
@@ -1555,5 +1947,7 @@ app.post('/api/uniqueizer/render', async (req, res) => {
   catch (error) { res.status(422).json({ status: 'error', error: error.message, hint: 'Установите FFmpeg и проверьте пути к файлам.' }); }
 });
 
-const server = app.listen(Number(process.env.PORT || 3030), () => console.log(`Creator Flow: http://localhost:${process.env.PORT || 3030}`));
+const serverPort = Number(process.env.PORT || 3030);
+const serverHost = String(process.env.CREATOR_FLOW_HOST || '127.0.0.1').trim() || '127.0.0.1';
+const server = app.listen(serverPort, serverHost, () => console.log(`Creator Flow: http://${serverHost}:${server.address().port}`));
 export { app, server };

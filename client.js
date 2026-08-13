@@ -1,7 +1,7 @@
 const state = {
   health: null, profiles: [], tasks: [], library: [], channelTasks: [], logs: [], proxies: [],
   settings: null, worker: null, accountStates: new Map(), analytics: new Map(), studioBatches: [], accountBatches: [],
-  bulkProfileIds: new Set(), folders: [],
+  bulkProfileIds: new Set(), channelBulkProfileIds: new Set(), folders: [],
 };
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
@@ -105,17 +105,17 @@ function renderWorkspaceStatus() {
 
 function taskStatusLabel(status) {
   const labels = {
-    queued: 'в очереди', scheduled: 'запланирована', starting: 'подготовка профиля', 'profile-ready': 'готова к загрузке',
+    queued: 'в очереди', scheduled: 'запланирована', starting: 'подготовка профиля', 'starting-profile': 'подготовка профиля', applying: 'применение изменений', 'profile-ready': 'готова к загрузке',
     uploading: 'загрузка в Studio', 'manual-login-required': 'нужен вход', 'login-ready': 'вход подтверждён',
-    'awaiting-review': 'на проверке', completed: 'выполнена', cancelled: 'отменена', error: 'ошибка',
+    'awaiting-review': 'на проверке', completed: 'выполнена', cancelled: 'отменена', error: 'ошибка', 'recovery-needed': 'требует проверки',
   };
   return labels[status] || status || 'неизвестно';
 }
 
 function taskStage(status) {
   const index = ['queued', 'scheduled'].includes(status) ? 0
-    : ['starting', 'manual-login-required'].includes(status) ? 1
-      : ['profile-ready', 'login-ready', 'uploading'].includes(status) ? 2 : 3;
+    : ['starting', 'starting-profile', 'manual-login-required'].includes(status) ? 1
+      : ['profile-ready', 'login-ready', 'uploading', 'applying'].includes(status) ? 2 : 3;
   return `<span class="task-stage" aria-label="Этап ${index + 1} из 4">${[0, 1, 2, 3].map(step => `<i class="${step < index ? 'done' : step === index ? 'current' : ''}"></i>`).join('')}</span>`;
 }
 
@@ -175,9 +175,10 @@ async function loadProfiles() {
   state.profiles = response.data || response.profiles || response.items || [];
   const availableIds = new Set(state.profiles.map(profileIdOf));
   state.bulkProfileIds = new Set([...state.bulkProfileIds].filter(id => availableIds.has(id)));
+  state.channelBulkProfileIds = new Set([...state.channelBulkProfileIds].filter(id => availableIds.has(id)));
   ['#task-profile', '#channel-profile', '#analytics-profile'].forEach(selector => fillProfileSelect($(selector)));
   $('#metric-profiles').textContent = formatNumber(state.profiles.length);
-  renderProfiles(); renderAccounts(); renderBulkProfilePicker(); renderWorkspaceStatus();
+  renderProfiles(); renderAccounts(); renderBulkProfilePicker(); renderChannelBulkProfilePicker(); renderWorkspaceStatus();
 }
 
 async function loadAccounts() {
@@ -535,6 +536,77 @@ async function createBulkQueue(event) {
   }
 }
 
+function renderChannelBulkProfilePicker() {
+  const target = $('#channel-bulk-profile-picker');
+  const counter = $('#channel-bulk-profile-count');
+  if (!target || !counter) return;
+  const selected = state.channelBulkProfileIds;
+  const ids = state.profiles.map(profileIdOf);
+  counter.textContent = `Выбрано: ${selected.size} из ${ids.length}`;
+  if (!ids.length) {
+    target.innerHTML = '<div class="empty">Сначала подключите хотя бы один профиль Dolphin.</div>';
+    return;
+  }
+  target.innerHTML = state.profiles.map(profile => {
+    const id = profileIdOf(profile);
+    const present = accountPresentation(profile);
+    return `<label class="bulk-profile-option"><input type="checkbox" value="${escapeHtml(id)}" ${selected.has(id) ? 'checked' : ''}><span class="profile-avatar ${present.tone === 'warn' ? 'warning' : present.tone === 'bad' ? 'error' : ''}">${escapeHtml(profileInitials(profile))}</span><span class="bulk-profile-copy"><b>${escapeHtml(profileNameOf(profile))}</b><small>${escapeHtml(present.label)}</small></span></label>`;
+  }).join('');
+  target.querySelectorAll('input[type="checkbox"]').forEach(input => {
+    input.onchange = () => {
+      if (input.checked) state.channelBulkProfileIds.add(input.value);
+      else state.channelBulkProfileIds.delete(input.value);
+      counter.textContent = `Выбрано: ${state.channelBulkProfileIds.size} из ${ids.length}`;
+    };
+  });
+}
+
+function setAllChannelBulkProfiles(selected) {
+  state.channelBulkProfileIds = selected ? new Set(state.profiles.map(profileIdOf)) : new Set();
+  renderChannelBulkProfilePicker();
+}
+
+function parseChannelLinks(value) {
+  return String(value || '').split(/\r?\n/)
+    .map(line => line.split('|').map(part => part.trim()))
+    .filter(parts => parts[0] && parts[1])
+    .map(([title, url]) => ({ title, url }));
+}
+
+async function createBulkChannelTasks(event) {
+  event.preventDefault();
+  if (!state.channelBulkProfileIds.size) return setMessage('#channel-bulk-message', 'Выберите хотя бы один профиль Dolphin.', 'error');
+  const body = {
+    profileIds: [...state.channelBulkProfileIds],
+    name: $('#channel-bulk-name').value.trim(),
+    description: $('#channel-bulk-description').value.trim(),
+    avatarPath: $('#channel-bulk-avatar').value.trim(),
+    bannerPath: $('#channel-bulk-banner').value.trim(),
+    links: parseChannelLinks($('#channel-bulk-links').value),
+    autoRun: $('#channel-bulk-auto-run').checked,
+  };
+  const button = $('#channel-bulk-submit');
+  button.disabled = true;
+  button.textContent = 'Создание…';
+  try {
+    const response = await api('/api/channels/tasks/bulk', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    setMessage('#channel-bulk-message', response.autoRun
+      ? `Создан пакет из ${response.created} задач. Оформление запускается по доступным потокам.`
+      : `Создан пакет из ${response.created} задач. Запустите его из списка задач оформления.`);
+    $('#channel-bulk-form').reset();
+    state.channelBulkProfileIds = new Set();
+    renderChannelBulkProfilePicker();
+    await Promise.all([loadChannelTasks(), loadLogs(), loadWorkerSettings()]);
+  } catch (error) {
+    setMessage('#channel-bulk-message', error.message, 'error');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Применить к выбранным каналам';
+  }
+}
+
 async function createDolphinProfile(event) {
   event.preventDefault();
   const button = $('#profile-create-submit');
@@ -632,7 +704,14 @@ async function removeLibraryItem(id) {
 
 function renderChannelTasks() {
   const target = $('#channel-tasks');
-  target.innerHTML = state.channelTasks.length ? state.channelTasks.map(task => `<div class="task"><span class="number">✎</span><span><b>${escapeHtml(task.name || 'Изменение оформления')}</b><br><small>${escapeHtml(task.profileId)} · ${escapeHtml(task.status)}${task.message ? ` · ${escapeHtml(task.message)}` : ''}</small></span><div>${statusPill(task.status)} ${task.status === 'completed' ? '' : `<button class="btn primary" data-channel-task="${escapeHtml(task.id)}">Применить</button>`}</div></div>`).join('') : '<div class="empty">Задач оформления пока нет.</div>';
+  target.innerHTML = state.channelTasks.length ? state.channelTasks.map(task => {
+    const profile = state.profiles.find(item => profileIdOf(item) === String(task.profileId));
+    const profileName = profile ? profileNameOf(profile) : task.profileId;
+    const automatic = task.source === 'bulk-channel' ? 'пакет' : 'один канал';
+    const canRun = ['queued', 'error', 'recovery-needed', 'manual-login-required'].includes(task.status);
+    const detail = task.message || task.error || '';
+    return `<article class="task"><span class="number">✎</span><div class="task-copy"><div class="task-title-row"><b>${escapeHtml(task.name || 'Изменение оформления')}</b>${statusPill(task.status, taskStatusLabel(task.status))}</div><small>${escapeHtml(profileName)} · ${automatic}${detail ? ` · ${escapeHtml(detail)}` : ''}</small>${taskStage(task.status)}</div><div class="task-side"><span class="meta-tag accent">${escapeHtml(profileName)}</span><div class="profile-actions">${canRun ? `<button class="btn primary" data-channel-task="${escapeHtml(task.id)}">Применить</button>` : ''}</div></div></article>`;
+  }).join('') : '<div class="empty">Задач оформления пока нет.</div>';
   target.querySelectorAll('[data-channel-task]').forEach(button => button.onclick = () => runChannelTask(button.dataset.channelTask, button));
 }
 
@@ -778,6 +857,9 @@ function bindEvents() {
   $('#library-import-path').onclick = importLibraryPath;
   $('#channel-read').onclick = () => readChannel(false);
   $('#channel-form').onsubmit = createChannelTask;
+  $('#channel-bulk-form').onsubmit = createBulkChannelTasks;
+  $('#channel-bulk-select-all').onclick = () => setAllChannelBulkProfiles(true);
+  $('#channel-bulk-select-none').onclick = () => setAllChannelBulkProfiles(false);
   $('#render-form').onsubmit = renderVideo;
   $('#analytics-profile').onchange = refreshAnalyticsView;
   $('#analytics-sync').onclick = () => syncAnalytics(false);
@@ -873,7 +955,7 @@ async function readChannel(restart = false) {
 
 async function createChannelTask(event) {
   event.preventDefault();
-  const links = $('#channel-links').value.split(/\r?\n/).map(line => line.split('|').map(part => part.trim())).filter(parts => parts[0] && parts[1]).map(([title, url]) => ({ title, url }));
+  const links = parseChannelLinks($('#channel-links').value);
   const body = { profileId: $('#channel-profile').value, name: $('#channel-name').value.trim(), description: $('#channel-description').value.trim(), avatarPath: $('#channel-avatar').value.trim(), bannerPath: $('#channel-banner').value.trim(), links };
   try { await api('/api/channels/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); event.target.reset(); fillProfileSelect($('#channel-profile')); await Promise.all([loadChannelTasks(), loadLogs()]); }
   catch (error) { $('#channel-identity').textContent = error.message; }
