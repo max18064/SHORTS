@@ -193,6 +193,7 @@ function assertWorkerSafetyContract(source) {
   assert.match(source, /addAndVerifyChannelLinks\(/, 'Links must be filled through their own labelled controls.');
   assert.match(source, /waitForStudioSaveSignal\(/, 'Studio must expose a save transition before a task is completed.');
   assert.match(source, /useOwnedPage: true/, 'Branding work must use an app-owned Studio tab.');
+  assert.match(source, /trustedStudioEditorUrl\(/, 'Read-only inspection must validate a known Studio editor URL before navigating.');
 
   const modernGuard = source.indexOf('if (await hasCurrentProfileEditorSurface(page, deadline, stage))');
   const legacyFallback = source.indexOf("const legacyIndex = semantic === 'avatar' ? 0 : 1;");

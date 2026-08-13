@@ -1334,7 +1334,8 @@ app.post('/api/profiles/:id/stop', async (req, res) => {
 async function readProfileChannel(profileId, restart = false) {
   const profileResult = await startDolphinForAutomation(profileId, restart);
   const wsEndpoint = getAutomationEndpoint(profileResult);
-  const inspected = wsEndpoint ? await inspectChannel({ wsEndpoint }) : { status: 'automation-unavailable' };
+  const cachedEditorUrl = cleanAccountUrl(accountStatusCache[String(profileId)]?.url);
+  const inspected = wsEndpoint ? await inspectChannel({ wsEndpoint, channelUrl: cachedEditorUrl }) : { status: 'automation-unavailable' };
   const channel = cacheAccountStatus(profileId, inspected);
   addLog(`Проверка YouTube-профиля ${profileId}: ${channel.status}`);
   return { profileId, channel };

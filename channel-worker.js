@@ -222,6 +222,17 @@ function customizationUrlsFromCurrentPage(currentUrl) {
   }
 }
 
+function trustedStudioEditorUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    if (url.protocol !== 'https:' || url.hostname !== 'studio.youtube.com') return '';
+    if (!/\/channel\/[^/?#]+\/(?:editing|customization)(?:[/?#]|$)/i.test(url.pathname)) return '';
+    return url.toString();
+  } catch {
+    return '';
+  }
+}
+
 function isCustomizationPage(currentUrl) {
   return /\/(?:customization|editing)(?:[/?#]|$)/i.test(String(currentUrl || ''));
 }
@@ -739,8 +750,18 @@ function channelNameFromPageText(pageText) {
 }
 
 /** Reads channel identity only; it does not alter channel settings. */
-export async function inspectChannel({ wsEndpoint, operationTimeoutMs } = {}) {
+export async function inspectChannel({ wsEndpoint, channelUrl = '', operationTimeoutMs } = {}) {
   return withStudio(wsEndpoint, async (page, deadline) => {
+    const directEditorUrl = trustedStudioEditorUrl(channelUrl);
+    if (directEditorUrl) {
+      await withinDeadline(deadline, 'Opening cached channel profile for read-only inspection', () => (
+        page.goto(directEditorUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: stepTimeout(deadline, 'Opening cached channel profile for read-only inspection'),
+        })
+      ));
+      await settleStudioPage(page, deadline, 'Waiting for cached channel profile');
+    }
     const opened = await openChannelCustomization(page, deadline);
     if (loginUrl.test(page.url())) return { status: 'manual-login-required', url: page.url() };
     const editorOpened = opened && await openChannelProfileSection(page, deadline, 'Opening channel profile for read-only inspection');
