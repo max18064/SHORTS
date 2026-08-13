@@ -536,6 +536,10 @@ try {
   assert.equal(typeof uniqueizer.available, 'boolean');
   if (uniqueizer.available) {
     const execFileAsync = promisify(execFile);
+    const ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
+    const ffprobePath = process.env.FFPROBE_PATH || (path.basename(ffmpegPath).toLowerCase().startsWith('ffmpeg')
+      ? path.join(path.dirname(ffmpegPath), process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe')
+      : 'ffprobe');
     await execFileAsync(process.env.FFMPEG_PATH || 'ffmpeg', ['-y', '-f', 'lavfi', '-i', 'color=c=blue:s=160x90:d=0.2', '-c:v', 'libx264', inputPath]);
     const streamedUpload = await fetch(`${base}/api/library/upload?name=streamed-input.mp4`, {
       method: 'POST',
@@ -580,6 +584,82 @@ try {
       presetCatalogue.presets.map(preset => preset.id),
       ['manual', 'shorts-balanced', 'soft-editorial', 'square-stories'],
     );
+    const metadataPresetCatalogue = await (await fetch(`${base}/api/uniqueizer/metadata-presets`)).json();
+    assert.deepEqual(
+      metadataPresetCatalogue.presets.map(preset => preset.id),
+      ['clean', 'source-title', 'project-export'],
+    );
+    const metadataCampaignResponse = await fetch(`${base}/api/campaigns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourcePaths: [streamedItem.filePath],
+        outputCount: 5,
+        outputFolder: testStateDir,
+        outputTemplate: 'campaign-metadata-{index}.mp4',
+        recipe: {
+          layout: 'keep', crop: 'none', speedMin: 1, speedMax: 1,
+          audioMode: 'original', metadataMode: 'clean', metadataPresetId: 'project-export',
+          metadataLines: [
+            'Alpha title | Alpha comment',
+            '"Bravo title","Bravo comment"',
+            'Charlie title; Charlie comment',
+          ],
+          addToLibrary: false,
+        },
+        distributionEnabled: false,
+        profileIds: [],
+        autoStart: false,
+        processingConcurrency: 1,
+        uploadConcurrency: 1,
+      }),
+    });
+    assert.equal(metadataCampaignResponse.status, 201);
+    const metadataCampaign = (await metadataCampaignResponse.json()).campaign;
+    assert.equal(metadataCampaign.metadataPresetId, 'user-list');
+    assert.equal(metadataCampaign.metadataLineCount, 3);
+    const expectedMetadataRows = new Map([
+      ['Alpha title', 'Alpha comment'],
+      ['Bravo title', 'Bravo comment'],
+      ['Charlie title', 'Charlie comment'],
+    ]);
+    assert.equal(metadataCampaign.assignments.length, 5);
+    assert.equal(new Set(metadataCampaign.assignments.map(item => item.recipe.edits.metadata.title)).size, 3);
+    assert.ok(metadataCampaign.assignments.every(item => {
+      const metadata = item.recipe.edits.metadata;
+      return metadata.presetId === 'user-list'
+        && expectedMetadataRows.get(metadata.title) === metadata.comment
+        && item.recipe.materialChanges.includes('metadata-user-list');
+    }));
+    const sourceTitleCampaignResponse = await fetch(`${base}/api/campaigns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourcePaths: [streamedItem.filePath], outputCount: 1, outputFolder: testStateDir,
+        outputTemplate: 'campaign-source-title-{index}.mp4',
+        recipe: { layout: 'keep', crop: 'none', speedMin: 1, speedMax: 1, audioMode: 'original', metadataMode: 'clean', metadataPresetId: 'source-title' },
+        distributionEnabled: false,
+      }),
+    });
+    assert.equal(sourceTitleCampaignResponse.status, 201);
+    const sourceTitleCampaign = (await sourceTitleCampaignResponse.json()).campaign;
+    assert.equal(sourceTitleCampaign.metadataPresetId, 'source-title');
+    assert.deepEqual(sourceTitleCampaign.assignments[0].recipe.edits.metadata, {
+      presetId: 'source-title',
+      title: path.basename(streamedItem.fileName || streamedItem.filePath, path.extname(streamedItem.fileName || streamedItem.filePath)),
+      comment: 'Local Creator Flow export',
+    });
+    const invalidMetadataLines = await fetch(`${base}/api/campaigns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourcePaths: [streamedItem.filePath], outputCount: 1, outputFolder: testStateDir,
+        outputTemplate: 'campaign-invalid-metadata-{index}.mp4',
+        recipe: { metadataMode: 'clean', metadataLines: [' | only a comment'] }, distributionEnabled: false,
+      }),
+    });
+    assert.equal(invalidMetadataLines.status, 400);
+    assert.equal((await invalidMetadataLines.json()).code, 'campaign-required');
     const presetCampaignResponse = await fetch(`${base}/api/campaigns`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -660,6 +740,30 @@ try {
     assert.ok(fs.existsSync(campaignOutputOne));
     assert.ok(fs.existsSync(campaignOutputTwo));
     assert.ok(renderedCampaign.assignments.every(item => item.status === 'completed'));
+    const cleanFormat = JSON.parse((await execFileAsync(ffprobePath, [
+      '-v', 'error', '-show_entries', 'format_tags=title,comment', '-of', 'json', campaignOutputOne,
+    ])).stdout).format?.tags || {};
+    assert.equal(Object.hasOwn(cleanFormat, 'title'), false);
+    assert.equal(Object.hasOwn(cleanFormat, 'comment'), false);
+
+    const runMetadataCampaign = await fetch(`${base}/api/campaigns/${metadataCampaign.id}/run`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
+    });
+    assert.equal(runMetadataCampaign.status, 202);
+    let renderedMetadataCampaign = null;
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      renderedMetadataCampaign = (await (await fetch(`${base}/api/campaigns/${metadataCampaign.id}`)).json()).campaign;
+      if (renderedMetadataCampaign.status === 'completed' || renderedMetadataCampaign.status === 'needs-attention') break;
+    }
+    assert.equal(renderedMetadataCampaign.status, 'completed', JSON.stringify(renderedMetadataCampaign.assignments));
+    for (const assignment of renderedMetadataCampaign.assignments) {
+      const tags = JSON.parse((await execFileAsync(ffprobePath, [
+        '-v', 'error', '-show_entries', 'format_tags=title,comment', '-of', 'json', assignment.outputPath,
+      ])).stdout).format?.tags || {};
+      assert.equal(tags.title, assignment.recipe.edits.metadata.title);
+      assert.equal(tags.comment, assignment.recipe.edits.metadata.comment);
+    }
 
     // A real local render through the complete visual-editorial path.  This
     // remains inside the isolated state directory: no Dolphin profile,

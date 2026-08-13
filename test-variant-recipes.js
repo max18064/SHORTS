@@ -207,6 +207,13 @@ assert.deepEqual(sourceTitleMetadata, {
   title: 'source-a',
   comment: 'Local Creator Flow export',
 }, 'source-title must be derived from the source basename, not a random value');
+assert.deepEqual(
+  resolveEditorialMetadataPreset({
+    presetId: 'source-title', source, campaignId: 'metadata-test', variantIndex: 7, title: 'Library display title',
+  }),
+  { presetId: 'source-title', title: 'Library display title', comment: 'Local Creator Flow export' },
+  'a caller may pass the preserved library display name instead of an internal storage filename',
+);
 const projectMetadata = resolveEditorialMetadataPreset({
   presetId: 'project-export', source, campaignId: 'metadata-test', variantIndex: 7,
 });

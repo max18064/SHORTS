@@ -375,7 +375,10 @@ function campaignMetadataLines() {
 function renderCampaignMetadataPreset() {
   const target = $('#campaign-metadata-preset-copy');
   if (!target) return;
-  target.textContent = currentCampaignMetadataPreset().description;
+  const lines = campaignMetadataLines();
+  target.textContent = lines.length
+    ? `Строк в списке: ${lines.length}. При создании кампании они будут перемешаны и сохранены за конкретными результатами.`
+    : currentCampaignMetadataPreset().description;
 }
 
 async function importCampaignMetadataFile(event) {
@@ -411,6 +414,9 @@ function renderCampaignPreset() {
   const metadataPreset = currentCampaignMetadataPreset();
   const recipe = campaignRecipePayload();
   const outputs = Math.max(1, Math.floor(campaignNumber('#campaign-output-count', 1)));
+  const metadataSummary = recipe.metadataLines.length
+    ? `строки из файла · ${recipe.metadataLines.length}`
+    : metadataPreset.summary;
   const labels = [
     `${outputs} результатов`,
     campaignLayoutLabel(recipe.layout),
@@ -418,7 +424,7 @@ function renderCampaignPreset() {
     recipe.fps === 'keep' ? 'исходный FPS' : `${recipe.fps} FPS`,
     `${recipe.bitrateKbps} Кбит/с`,
     recipe.colorCorrectionEnabled ? `цветокор ${recipe.colorStrength}%` : 'цветокор выключен',
-    `экспорт: ${metadataPreset.summary}`,
+    `экспорт: ${metadataSummary}`,
     ...(recipe.usePresetOverlay ? ['встроенная цветная PNG‑карточка'] : []),
     ...(recipe.overlayPath ? ['свой PNG подключён'] : recipe.usePresetOverlay ? [] : ['PNG не указан']),
     recipe.textVariations.length ? `текст: ${recipe.textVariations.length} фраз` : 'текст не задан',
@@ -464,6 +470,9 @@ function updateCampaignRecipeSummary() {
   if (!target) return;
   const recipe = campaignRecipePayload();
   const metadataPreset = currentCampaignMetadataPreset();
+  const metadataSummary = recipe.metadataLines.length
+    ? `строки из файла · ${recipe.metadataLines.length}`
+    : metadataPreset.summary;
   const labels = [];
   if (recipe.usePresetOverlay) labels.push('встроенная цветная PNG‑карточка');
   if (recipe.overlayPath) labels.push(`оверлей · ${recipe.overlayPosition}`);
@@ -475,8 +484,7 @@ function updateCampaignRecipeSummary() {
   if (recipe.audioMode === 'mute') labels.push('без звука');
   else if (recipe.audioPath) labels.push('фоновая дорожка');
   else if (recipe.audioMode === 'normalize') labels.push('громкость нормализуется');
-  labels.push(`экспорт · ${metadataPreset.summary}`);
-  if (recipe.metadataLines.length) labels.push(`подписи · ${recipe.metadataLines.length}`);
+  labels.push(`экспорт · ${metadataSummary}`);
   target.innerHTML = labels.map(label => `<span>${escapeHtml(label)}</span>`).join('');
   renderCampaignMetadataPreset();
   renderCampaignPreset();
@@ -564,10 +572,14 @@ function renderCampaigns(loadError = null) {
       const itemStatus = item.status || item.stage || 'queued';
       const details = item.message || item.error || item.sourceName || item.sourcePath || '';
       const recipeChanges = Array.isArray(item.recipe?.materialChanges) ? item.recipe.materialChanges.join(', ') : '';
+      const exportTitle = item.recipe?.edits?.metadata?.title;
+      const exportMetadata = exportTitle
+        ? `<span class="meta-tag" title="Экспортный заголовок: ${escapeHtml(exportTitle)}">экспорт: ${escapeHtml(String(exportTitle).slice(0, 72))}</span>`
+        : '';
       const duplicate = Number(item.duplicateRenderGroupSize || 1) > 1
         ? `<span class="meta-tag">совпадающий рецепт: ${escapeHtml(item.duplicateRenderGroupSize)}</span>`
         : '';
-      return `<div class="campaign-progress-row"><div><b>${escapeHtml(campaignItemLabel(item))}</b><small>${escapeHtml(details)}${recipeChanges ? ` · ${escapeHtml(recipeChanges)}` : ''}</small></div><div><span class="meta-tag accent">${escapeHtml(campaignProfileLabel(item))}</span>${duplicate}</div><div class="right">${statusPill(itemStatus, taskStatusLabel(itemStatus))}</div></div>`;
+      return `<div class="campaign-progress-row"><div><b>${escapeHtml(campaignItemLabel(item))}</b><small>${escapeHtml(details)}${recipeChanges ? ` · ${escapeHtml(recipeChanges)}` : ''}</small></div><div><span class="meta-tag accent">${escapeHtml(campaignProfileLabel(item))}</span>${exportMetadata}${duplicate}</div><div class="right">${statusPill(itemStatus, taskStatusLabel(itemStatus))}</div></div>`;
     }).join('') || '<div class="empty">Сервер подготовит здесь распределение роликов по профилям после создания кампании.</div>';
     const duplicateGroups = Array.isArray(campaign.duplicateRenderGroups) ? campaign.duplicateRenderGroups : [];
     const duplicateNotice = duplicateGroups.length

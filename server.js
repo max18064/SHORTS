@@ -15,7 +15,9 @@ import {
   MAX_EDITORIAL_CAMPAIGN_OUTPUTS,
   buildFfmpegArgs,
   createEditorialRecipe,
+  listEditorialMetadataPresets,
   listEditorialPresets,
+  resolveEditorialMetadataPreset,
   resolveEditorialPreset,
   validateEditorialRecipe,
 } from './variant-recipes.js';
@@ -897,7 +899,11 @@ function startProcessingBatchItem(batch, item) {
     .finally(() => {
       activeProcessingJobIds.delete(item.id);
       activeProcessingOutputPaths.delete(item.outputPath);
-      if (backgroundEnabled) {
+      // An explicit campaign/batch Run command must drain its queued work even
+      // when background scheduling is disabled for diagnostics or tests.
+      // Newly-created drafts still do nothing until their batch is marked
+      // autoRun by that command.
+      if (backgroundEnabled || batch.autoRun === true) {
         queueMicrotask(() => processProcessingBatches().catch(error => addLog(`Ошибка очереди обработки файлов: ${error.message}`, null, 'error')));
       }
     });
@@ -959,6 +965,7 @@ function queueProcessingRetry(batch, item) {
 const MAX_MEDIA_CAMPAIGNS = 40;
 const MAX_CAMPAIGN_PROFILES = 20;
 const MAX_CAMPAIGN_TAGS = 50;
+const MAX_CAMPAIGN_METADATA_LINES = MAX_EDITORIAL_CAMPAIGN_OUTPUTS;
 
 function campaignError(message, statusCode = 400, code = 'campaign-invalid') {
   const error = new Error(message);
@@ -1159,6 +1166,99 @@ function normalizeCampaignPresetId(body) {
     throw campaignError('The selected uniqueizer preset is not supported.', 422, 'campaign-preset-invalid');
   }
   return presetId;
+}
+
+function normalizeCampaignMetadataPresetId(body) {
+  const raw = body?.metadataPresetId ?? body?.recipe?.metadataPresetId ?? 'clean';
+  if (typeof raw !== 'string') {
+    throw campaignError('Metadata preset must be a text value.', 400, 'campaign-metadata-preset-invalid');
+  }
+  const presetId = raw.trim().toLowerCase() || 'clean';
+  if (!listEditorialMetadataPresets().some(preset => preset.id === presetId)) {
+    throw campaignError('The selected export metadata preset is not supported.', 422, 'campaign-metadata-preset-invalid');
+  }
+  return presetId;
+}
+
+function splitCampaignMetadataRow(value) {
+  const preferredSeparator = value.indexOf('|');
+  if (preferredSeparator >= 0) return [value.slice(0, preferredSeparator), value.slice(preferredSeparator + 1)];
+  const delimiter = value.includes(';') ? ';' : value.includes(',') ? ',' : '';
+  if (!delimiter) return [value, ''];
+  let quoted = false;
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] === '"') {
+      if (quoted && value[index + 1] === '"') {
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (value[index] === delimiter && !quoted) {
+      return [value.slice(0, index), value.slice(index + 1)];
+    }
+  }
+  return [value, ''];
+}
+
+function normalizeCampaignMetadataField(value) {
+  const trimmed = String(value).trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed.slice(1, -1).replaceAll('""', '"');
+  }
+  return trimmed;
+}
+
+function normalizeCampaignMetadataLines(body) {
+  const raw = body?.metadataLines ?? body?.recipe?.metadataLines;
+  if (raw === undefined || raw === null || raw === '') return [];
+  if (!Array.isArray(raw) || raw.some(value => typeof value !== 'string')) {
+    throw campaignError('Metadata rows must be a list of text lines.', 400, 'campaign-metadata-lines');
+  }
+  if (raw.length > MAX_CAMPAIGN_METADATA_LINES) {
+    throw campaignError(`Use no more than ${MAX_CAMPAIGN_METADATA_LINES} metadata rows.`, 422, 'campaign-metadata-lines');
+  }
+  return raw.map((value, index) => {
+    const [rawTitle, rawComment] = splitCampaignMetadataRow(value);
+    const title = normalizeCampaignText(normalizeCampaignMetadataField(rawTitle), `Metadata row ${index + 1} title`, {
+      required: true,
+      maxLength: 200,
+    });
+    const comment = normalizeCampaignText(normalizeCampaignMetadataField(rawComment), `Metadata row ${index + 1} comment`, {
+      maxLength: 500,
+    });
+    return comment ? { title, comment } : { title };
+  });
+}
+
+function campaignMetadataShuffleSeed(campaignId) {
+  let state = 0x811c9dc5;
+  for (const character of String(campaignId)) {
+    state ^= character.codePointAt(0);
+    state = Math.imul(state, 0x01000193);
+  }
+  return (state >>> 0) || 0x6d2b79f5;
+}
+
+function nextCampaignMetadataRandom(state) {
+  let value = state.value >>> 0;
+  value ^= value << 13;
+  value ^= value >>> 17;
+  value ^= value << 5;
+  state.value = value >>> 0;
+  return state.value;
+}
+
+// The random-looking order is derived from the generated campaign ID, then
+// saved into every recipe.  That gives one stable assignment for retries and
+// restarts instead of silently re-shuffling a user's imported rows.
+function shuffledCampaignMetadataLines(lines, campaignId) {
+  const shuffled = lines.map(line => ({ ...line }));
+  const state = { value: campaignMetadataShuffleSeed(campaignId) };
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = nextCampaignMetadataRandom(state) % (index + 1);
+    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+  }
+  return shuffled;
 }
 
 function campaignUsesBuiltInPresetOverlay(body, presetId) {
@@ -1406,6 +1506,8 @@ function publicMediaCampaign(campaign) {
     status: campaign.status,
     autoRun: campaign.autoRun === true,
     presetId: campaign.presetId || 'manual',
+    metadataPresetId: campaign.metadataPresetId || 'clean',
+    metadataLineCount: Number(campaign.metadataLineCount || 0),
     usesBuiltInPresetOverlay: campaign.usesBuiltInPresetOverlay === true,
     distributionEnabled: campaign.distributionEnabled === true,
     sourcePaths: campaign.sourcePaths || [],
@@ -1550,6 +1652,10 @@ function createMediaCampaign(body) {
   const addToLibrary = body?.recipe?.addToLibrary !== false;
   const campaignId = crypto.randomUUID();
   const presetId = normalizeCampaignPresetId(body);
+  const requestedMetadataPresetId = normalizeCampaignMetadataPresetId(body);
+  const metadataLines = normalizeCampaignMetadataLines(body);
+  const metadataPresetId = metadataLines.length ? 'user-list' : requestedMetadataPresetId;
+  const shuffledMetadataLines = metadataLines.length ? shuffledCampaignMetadataLines(metadataLines, campaignId) : [];
   const usesBuiltInPresetOverlay = campaignUsesBuiltInPresetOverlay(body, presetId);
   const now = new Date().toISOString();
   const seenOutputs = new Set();
@@ -1571,6 +1677,17 @@ function createMediaCampaign(body) {
       : body?.recipe;
     const baseEdits = normalizeCampaignRecipeInput(recipeInput, source, outputIndex);
     if (usesBuiltInPresetOverlay) baseEdits.overlay = builtInPresetOverlayFor(presetId, outputIndex);
+    const metadataLine = shuffledMetadataLines.length
+      ? shuffledMetadataLines[(outputIndex - 1) % shuffledMetadataLines.length]
+      : null;
+    baseEdits.metadata = resolveEditorialMetadataPreset({
+      presetId: metadataPresetId,
+      source: { id: source.id, filePath: source.filePath, hasAudio: source.hasAudio },
+      campaignId,
+      variantIndex: outputIndex,
+      ...(metadataPresetId === 'source-title' ? { title: campaignSourceName(source) } : {}),
+      ...(metadataLine || {}),
+    });
     const edits = resolveEditorialPreset({
       presetId,
       baseEdits,
@@ -1631,6 +1748,8 @@ function createMediaCampaign(body) {
     status: 'queued',
     autoRun,
     presetId,
+    metadataPresetId,
+    metadataLineCount: metadataLines.length,
     usesBuiltInPresetOverlay,
     distributionEnabled,
     sourcePaths: sources.map(source => source.filePath),
@@ -3226,6 +3345,10 @@ app.post('/api/campaigns/:id/run', async (req, res) => {
 
 app.get('/api/uniqueizer/presets', (_req, res) => {
   res.json({ presets: listEditorialPresets() });
+});
+
+app.get('/api/uniqueizer/metadata-presets', (_req, res) => {
+  res.json({ presets: listEditorialMetadataPresets() });
 });
 
 app.get('/api/uniqueizer/health', async (_req, res) => {

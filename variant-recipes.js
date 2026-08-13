@@ -425,7 +425,9 @@ export function resolveEditorialMetadataPreset({
   if (normalizedPresetId === 'source-title') {
     return normalizeMetadata({
       presetId: normalizedPresetId,
-      title: metadataSourceTitle(normalizedSource),
+      title: title === undefined
+        ? metadataSourceTitle(normalizedSource)
+        : normalizeMetadataText(title, 'title', MAX_METADATA_TITLE_LENGTH),
       comment: 'Local Creator Flow export',
     });
   }
@@ -989,7 +991,7 @@ function qualityCrf(quality) {
 /**
  * Turn a validated recipe into an argv array for child_process.execFile().
  * This function never invokes a shell.  It always removes container metadata
- * and never writes invented metadata fields.
+ * before writing only explicitly resolved title/comment fields.
  */
 export function buildFfmpegArgs(recipe, { outputPath, overwrite = false } = {}) {
   const normalizedRecipe = assertRecipeMatchesIdentity(recipe);
