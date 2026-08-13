@@ -14,6 +14,8 @@ import {
   MAX_EDITORIAL_CAMPAIGN_OUTPUTS,
   buildFfmpegArgs,
   createEditorialRecipe,
+  listEditorialPresets,
+  resolveEditorialPreset,
   validateEditorialRecipe,
 } from './variant-recipes.js';
 
@@ -1140,6 +1142,18 @@ function normalizeCampaignFontPath(raw) {
   return fontPath;
 }
 
+function normalizeCampaignPresetId(body) {
+  const raw = body?.presetId ?? body?.recipe?.presetId ?? 'manual';
+  if (typeof raw !== 'string') {
+    throw campaignError('Preset must be a text value.', 400, 'campaign-preset-invalid');
+  }
+  const presetId = raw.trim().toLowerCase() || 'manual';
+  if (!listEditorialPresets().some(preset => preset.id === presetId)) {
+    throw campaignError('The selected uniqueizer preset is not supported.', 422, 'campaign-preset-invalid');
+  }
+  return presetId;
+}
+
 function normalizeCampaignRecipeInput(raw, source, outputIndex) {
   const input = isObjectRecord(raw) ? raw : {};
   const layout = ['vertical-9x16', 'square-1x1', 'keep'].includes(input.layout) ? input.layout : 'vertical-9x16';
@@ -1354,6 +1368,7 @@ function publicMediaCampaign(campaign) {
     updatedAt: campaign.updatedAt,
     status: campaign.status,
     autoRun: campaign.autoRun === true,
+    presetId: campaign.presetId || 'manual',
     distributionEnabled: campaign.distributionEnabled === true,
     sourcePaths: campaign.sourcePaths || [],
     outputCount: campaign.outputCount,
@@ -1496,6 +1511,7 @@ function createMediaCampaign(body) {
   const autoRun = body?.autoStart === true;
   const addToLibrary = body?.recipe?.addToLibrary !== false;
   const campaignId = crypto.randomUUID();
+  const presetId = normalizeCampaignPresetId(body);
   const now = new Date().toISOString();
   const seenOutputs = new Set();
   const assignments = [];
@@ -1510,8 +1526,16 @@ function createMediaCampaign(body) {
       throw campaignError(`Another local processing task already reserves: ${path.basename(outputPath)}`, 409, 'campaign-output-reserved');
     }
     seenOutputs.add(outputPath);
-    const edits = normalizeCampaignRecipeInput(body?.recipe, source, outputIndex);
     const profileId = distributionEnabled ? profileIds[(outputIndex - 1) % profileIds.length] : '';
+    const baseEdits = normalizeCampaignRecipeInput(body?.recipe, source, outputIndex);
+    const edits = resolveEditorialPreset({
+      presetId,
+      baseEdits,
+      source: { id: source.id, filePath: source.filePath, hasAudio: source.hasAudio },
+      campaignId,
+      variantIndex: outputIndex,
+      profileId: profileId || 'local-render',
+    });
     const recipe = createEditorialRecipe({ source: { id: source.id, filePath: source.filePath, hasAudio: source.hasAudio }, campaignId, variantIndex: outputIndex, profileId: profileId || 'local-render', edits });
     const assignmentId = crypto.randomUUID();
     const itemId = crypto.randomUUID();
@@ -1563,6 +1587,7 @@ function createMediaCampaign(body) {
     updatedAt: now,
     status: 'queued',
     autoRun,
+    presetId,
     distributionEnabled,
     sourcePaths: sources.map(source => source.filePath),
     outputCount,
@@ -3153,6 +3178,10 @@ app.post('/api/campaigns/:id/run', async (req, res) => {
   } catch (error) {
     return res.status(error.statusCode || 422).json({ error: error.message, code: error.code || 'campaign-run-failed' });
   }
+});
+
+app.get('/api/uniqueizer/presets', (_req, res) => {
+  res.json({ presets: listEditorialPresets() });
 });
 
 app.get('/api/uniqueizer/health', async (_req, res) => {

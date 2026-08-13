@@ -22,6 +22,7 @@ const processingOutputPath = path.join(testStateDir, 'batch-processed.mp4');
 const campaignOutputOne = path.join(testStateDir, 'campaign-1.mp4');
 const campaignOutputTwo = path.join(testStateDir, 'campaign-2.mp4');
 const campaignVisualOutput = path.join(testStateDir, 'campaign-visual-1.mp4');
+const campaignPresetRenderOutput = path.join(testStateDir, 'campaign-preset-render-1.mp4');
 const campaignOverlayPath = path.join(testStateDir, 'campaign-overlay.png');
 const bulkVideoPath = path.join(testStateDir, 'bulk-source.mp4');
 const channelAvatarPath = path.join(testStateDir, 'channel-avatar.png');
@@ -574,6 +575,52 @@ try {
     assert.equal(noProfilesCampaign.assignments.length, 2);
     assert.ok(noProfilesCampaign.assignments.every(item => item.status === 'queued' && item.recipe?.recipeId));
     assert.notEqual(noProfilesCampaign.assignments[0].recipe.renderSignature, noProfilesCampaign.assignments[1].recipe.renderSignature);
+    const presetCatalogue = await (await fetch(`${base}/api/uniqueizer/presets`)).json();
+    assert.deepEqual(
+      presetCatalogue.presets.map(preset => preset.id),
+      ['manual', 'shorts-balanced', 'soft-editorial', 'square-stories'],
+    );
+    const presetCampaignResponse = await fetch(`${base}/api/campaigns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourcePaths: [streamedItem.filePath],
+        outputCount: 10,
+        outputFolder: testStateDir,
+        outputTemplate: 'campaign-preset-{index}.mp4',
+        presetId: 'shorts-balanced',
+        recipe: {
+          presetId: 'shorts-balanced',
+          textVariations: [],
+          audioMode: 'original',
+          metadataMode: 'clean',
+          addToLibrary: false,
+        },
+        distributionEnabled: false,
+        profileIds: [],
+        autoStart: false,
+        processingConcurrency: 1,
+        uploadConcurrency: 1,
+      }),
+    });
+    assert.equal(presetCampaignResponse.status, 201);
+    const presetCampaign = (await presetCampaignResponse.json()).campaign;
+    assert.equal(presetCampaign.presetId, 'shorts-balanced');
+    assert.equal(presetCampaign.assignments.length, 10);
+    assert.equal(new Set(presetCampaign.assignments.map(item => item.recipe.renderSignature)).size, 10);
+    assert.ok(presetCampaign.assignments.every(item => item.recipe.edits.crop?.aspect === '9:16'));
+    assert.ok(presetCampaign.assignments.every(item => item.recipe.edits.video?.fps));
+    assert.deepEqual(presetCampaign.duplicateRenderGroups, []);
+    const invalidPresetCampaign = await fetch(`${base}/api/campaigns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourcePaths: [streamedItem.filePath], outputCount: 1, outputFolder: testStateDir,
+        outputTemplate: 'invalid-preset-{index}.mp4', presetId: 'not-a-preset', distributionEnabled: false,
+      }),
+    });
+    assert.equal(invalidPresetCampaign.status, 422);
+    assert.equal((await invalidPresetCampaign.json()).code, 'campaign-preset-invalid');
     const collidingCampaign = await fetch(`${base}/api/campaigns`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -586,7 +633,8 @@ try {
     assert.equal(collidingCampaign.status, 409);
     assert.equal((await collidingCampaign.json()).code, 'campaign-output-reserved');
     const campaignList = await (await fetch(`${base}/api/campaigns`)).json();
-    assert.equal(campaignList.campaigns[0].id, noProfilesCampaign.id);
+    assert.ok(campaignList.campaigns.some(campaign => campaign.id === noProfilesCampaign.id));
+    assert.ok(campaignList.campaigns.some(campaign => campaign.id === presetCampaign.id));
     const invalidCampaignRecipe = await fetch(`${base}/api/campaigns`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -663,6 +711,42 @@ try {
     assert.equal(renderedVisualCampaign.status, 'completed', JSON.stringify(renderedVisualCampaign.assignments[0]));
     assert.ok(fs.existsSync(campaignVisualOutput));
     assert.equal(renderedVisualCampaign.assignments[0].status, 'completed');
+
+    // This covers the full named-preset path as well: it resolves an explicit
+    // vertical recipe on the server and renders it locally through FFmpeg.
+    const presetRenderResponse = await fetch(`${base}/api/campaigns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourcePaths: [streamedItem.filePath],
+        outputCount: 1,
+        outputFolder: testStateDir,
+        outputTemplate: 'campaign-preset-render-{index}.mp4',
+        presetId: 'shorts-balanced',
+        recipe: { presetId: 'shorts-balanced', audioMode: 'original', metadataMode: 'clean', addToLibrary: false },
+        distributionEnabled: false,
+        profileIds: [],
+        autoStart: false,
+        processingConcurrency: 1,
+        uploadConcurrency: 1,
+      }),
+    });
+    assert.equal(presetRenderResponse.status, 201);
+    const presetRenderCampaign = (await presetRenderResponse.json()).campaign;
+    assert.equal(presetRenderCampaign.assignments[0].recipe.edits.crop.aspect, '9:16');
+    const presetRun = await fetch(`${base}/api/campaigns/${presetRenderCampaign.id}/run`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
+    });
+    assert.equal(presetRun.status, 202);
+    let renderedPresetCampaign = null;
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      renderedPresetCampaign = (await (await fetch(`${base}/api/campaigns/${presetRenderCampaign.id}`)).json()).campaign;
+      if (renderedPresetCampaign.status === 'completed' || renderedPresetCampaign.status === 'needs-attention') break;
+    }
+    assert.equal(renderedPresetCampaign.status, 'completed', JSON.stringify(renderedPresetCampaign.assignments[0]));
+    assert.ok(fs.existsSync(campaignPresetRenderOutput));
+    assert.equal(renderedPresetCampaign.assignments[0].status, 'completed');
     const invalidProcessingBatch = await fetch(`${base}/api/processing/batches`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ jobs: [{ inputPath: streamedItem.filePath, outputPath: path.join(testStateDir, 'not-an-mp4.mov') }] }),
