@@ -14,6 +14,8 @@ const MAX_OVERLAY_MARGIN = 2_000;
 const MAX_TEXT_LENGTH = 280;
 const MAX_TEXT_SIZE = 512;
 const MAX_TEXT_OUTLINE = 32;
+const MAX_METADATA_TITLE_LENGTH = 200;
+const MAX_METADATA_COMMENT_LENGTH = 500;
 const MIN_PACE = 0.95;
 const MAX_PACE = 1.05;
 const AUDIO_MODES = new Set(['keep', 'mute', 'gain', 'mix']);
@@ -35,6 +37,32 @@ const CROP_ASPECTS = Object.freeze({
 const CROP_POSITIONS = new Set(['center', 'top', 'bottom', 'left', 'right']);
 const SCALE_FITS = new Set(['contain', 'cover', 'stretch']);
 const MUSIC_EXTENSIONS = new Set(['.aac', '.flac', '.m4a', '.mp3', '.ogg', '.opus', '.wav']);
+
+// The public list contains only user-selectable deterministic presets.  The
+// `user-list` value below is an explicit per-output mapping mode, not a
+// preset that generates data on its own.
+export const EDITORIAL_METADATA_PRESETS = Object.freeze([
+  Object.freeze({
+    id: 'clean',
+    name: 'Clean export',
+    description: 'Remove inherited container metadata and write no export fields.',
+  }),
+  Object.freeze({
+    id: 'source-title',
+    name: 'Source title',
+    description: 'Use the source filename as the explicit export title.',
+  }),
+  Object.freeze({
+    id: 'project-export',
+    name: 'Project export',
+    description: 'Use a deterministic Creator Flow export title and local-project comment.',
+  }),
+]);
+
+const EDITORIAL_METADATA_PRESET_IDS = new Set([
+  ...EDITORIAL_METADATA_PRESETS.map(preset => preset.id),
+  'user-list',
+]);
 
 function recipeError(message, code = 'editorial-recipe-invalid') {
   const error = new TypeError(message);
@@ -300,6 +328,120 @@ function normalizeVideo(rawVideo) {
   return Object.keys(result).length ? result : null;
 }
 
+function normalizeMetadataPresetId(value, label = 'edits.metadata.presetId') {
+  const presetId = normalizedText(value, label, { required: true, maxLength: 32 }).toLowerCase();
+  if (!EDITORIAL_METADATA_PRESET_IDS.has(presetId)) {
+    throw recipeError(`${label} is not supported.`, 'editorial-metadata-preset-invalid');
+  }
+  return presetId;
+}
+
+function hasOwn(object, key) {
+  return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+function normalizeMetadataText(value, label, maxLength) {
+  return normalizedText(value, label, { required: true, maxLength });
+}
+
+function normalizeMetadata(rawMetadata) {
+  if (rawMetadata === undefined || rawMetadata === null) return null;
+  const metadata = asPlainObject(rawMetadata, 'edits.metadata');
+  const allowedKeys = new Set(['presetId', 'title', 'comment']);
+  for (const key of Object.keys(metadata)) {
+    if (!allowedKeys.has(key)) {
+      throw recipeError(`edits.metadata.${key} is not allowed.`, 'editorial-metadata-field-invalid');
+    }
+  }
+
+  const presetId = normalizeMetadataPresetId(metadata.presetId);
+  const hasTitle = hasOwn(metadata, 'title');
+  const hasComment = hasOwn(metadata, 'comment');
+  if (presetId === 'clean') {
+    if (hasTitle || hasComment) {
+      throw recipeError('edits.metadata.clean must not contain title or comment.', 'editorial-metadata-field-invalid');
+    }
+    return { presetId };
+  }
+
+  // Named metadata presets resolve to both explicit fields.  User-list is a
+  // transparent override mode: it never invents a title or comment, and must
+  // have an operator-supplied title for each mapped output.
+  if (!hasTitle) {
+    throw recipeError(`edits.metadata.${presetId} requires an explicit title.`, 'editorial-metadata-field-invalid');
+  }
+  const normalized = {
+    presetId,
+    title: normalizeMetadataText(metadata.title, 'edits.metadata.title', MAX_METADATA_TITLE_LENGTH),
+  };
+  if (hasComment) {
+    normalized.comment = normalizeMetadataText(metadata.comment, 'edits.metadata.comment', MAX_METADATA_COMMENT_LENGTH);
+  } else if (presetId !== 'user-list') {
+    throw recipeError(`edits.metadata.${presetId} requires an explicit comment.`, 'editorial-metadata-field-invalid');
+  }
+  return normalized;
+}
+
+function metadataSourceTitle(source) {
+  const extension = path.extname(source.filePath);
+  const baseName = path.basename(source.filePath, extension) || path.basename(source.filePath);
+  return normalizeMetadataText(baseName, 'source filename title', MAX_METADATA_TITLE_LENGTH);
+}
+
+/**
+ * Return public metadata preset information for a UI selector.  `user-list`
+ * is deliberately omitted: it is only a per-output explicit mapping mode.
+ */
+export function listEditorialMetadataPresets() {
+  return EDITORIAL_METADATA_PRESETS.map(({ id, name, description }) => ({ id, name, description }));
+}
+
+/**
+ * Resolve a metadata selector into the exact fields that will be written into
+ * an export.  It uses no dates, device values, encoder tags, IDs, or random
+ * data.  `user-list` is accepted only with a caller-provided title (and an
+ * optional caller-provided comment), so it cannot generate any values by
+ * itself.
+ */
+export function resolveEditorialMetadataPreset({
+  presetId = 'clean',
+  source,
+  campaignId = '',
+  variantIndex = 1,
+  title,
+  comment,
+} = {}) {
+  const normalizedSource = normalizeSource(source);
+  // Keep input validation and call shape consistent with other deterministic
+  // resolvers, even though campaignId does not participate in the permitted
+  // export fields.
+  normalizedText(campaignId, 'campaignId', { maxLength: MAX_ID_LENGTH });
+  const normalizedVariantIndex = normalizedInteger(variantIndex, 'variantIndex', {
+    min: 1,
+    max: MAX_EDITORIAL_CAMPAIGN_OUTPUTS,
+  });
+  const normalizedPresetId = normalizeMetadataPresetId(presetId, 'presetId');
+  if (normalizedPresetId === 'clean') return normalizeMetadata({ presetId: 'clean' });
+  if (normalizedPresetId === 'source-title') {
+    return normalizeMetadata({
+      presetId: normalizedPresetId,
+      title: metadataSourceTitle(normalizedSource),
+      comment: 'Local Creator Flow export',
+    });
+  }
+  if (normalizedPresetId === 'project-export') {
+    return normalizeMetadata({
+      presetId: normalizedPresetId,
+      title: `Creator Flow export ${normalizedVariantIndex}`,
+      comment: 'Local project export',
+    });
+  }
+  const explicit = { presetId: normalizedPresetId };
+  if (title !== undefined) explicit.title = title;
+  if (comment !== undefined) explicit.comment = comment;
+  return normalizeMetadata(explicit);
+}
+
 function normalizeAudio(rawAudio, source, pace) {
   const input = rawAudio === undefined || rawAudio === null ? {} : asPlainObject(rawAudio, 'edits.audio');
   const mode = normalizedText(input.mode ?? 'keep', 'edits.audio.mode', { required: true, maxLength: 20 });
@@ -346,11 +488,13 @@ export function normalizeEditorialEdits(rawEdits = {}, { source, variationSeed =
   const text = normalizeText(edits.text);
   const color = normalizeColor(edits.color);
   const video = normalizeVideo(edits.video);
+  const metadata = normalizeMetadata(edits.metadata);
   // Omit inactive new fields.  This preserves the signed form of recipes
   // created before these optional controls existed.
   if (text) normalized.text = text;
   if (color) normalized.color = color;
   if (video) normalized.video = video;
+  if (metadata) normalized.metadata = metadata;
   return normalized;
 }
 
@@ -369,6 +513,7 @@ function materialChanges(edits) {
   if (edits.video?.fps) changes.push(`fps-${edits.video.fps}`);
   if (edits.video?.bitrateKbps) changes.push(`bitrate-${edits.video.bitrateKbps}k`);
   if (edits.video?.quality) changes.push(`quality-${edits.video.quality}`);
+  if (edits.metadata) changes.push(`metadata-${edits.metadata.presetId}`);
   if (edits.pace !== 1) changes.push(`pace-${decimal(edits.pace)}x`);
   if (edits.audio.mode === 'mute') changes.push('audio-muted');
   if (edits.audio.mode === 'gain') changes.push(`audio-gain-${decimal(edits.audio.gainDb)}db`);
@@ -920,9 +1065,12 @@ export function buildFfmpegArgs(recipe, { outputPath, overwrite = false } = {}) 
   if (filters.length) args.push('-filter_complex', filters.join(';'));
   args.push('-map', videoLabel === '[0:v]' ? '0:v:0' : videoLabel);
   if (audioMap) args.push('-map', audioMap);
+  // Clear inherited container fields first.  The narrowly-whitelisted title
+  // and comment below are the only export metadata this module can write.
+  args.push('-map_metadata', '-1', '-map_chapters', '-1');
+  if (edits.metadata?.title) args.push('-metadata', `title=${edits.metadata.title}`);
+  if (edits.metadata?.comment) args.push('-metadata', `comment=${edits.metadata.comment}`);
   args.push(
-    '-map_metadata', '-1',
-    '-map_chapters', '-1',
     '-c:v', 'libx264',
     '-preset', 'medium',
   );

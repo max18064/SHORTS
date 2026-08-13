@@ -4,9 +4,12 @@ import {
   buildFfmpegArgs,
   createEditorialCampaignPlan,
   createEditorialRecipe,
+  EDITORIAL_METADATA_PRESETS,
   EDITORIAL_PRESETS,
+  listEditorialMetadataPresets,
   listEditorialPresets,
   normalizeEditorialEdits,
+  resolveEditorialMetadataPreset,
   resolveEditorialPreset,
   validateEditorialRecipe,
 } from './variant-recipes.js';
@@ -184,6 +187,115 @@ assert.throws(
   () => validateEditorialRecipe({ ...first, recipeId: 'edr-tampered' }),
   /recipeId does not match/,
   'worker-side validation must reject changed recipe content',
+);
+
+assert.deepEqual(
+  listEditorialMetadataPresets().map(preset => preset.id),
+  ['clean', 'source-title', 'project-export'],
+  'the public metadata selector must expose only its three deterministic presets',
+);
+assert.equal(EDITORIAL_METADATA_PRESETS.length, 3, 'metadata preset definitions stay available to callers');
+const cleanMetadata = resolveEditorialMetadataPreset({
+  presetId: 'clean', source, campaignId: 'metadata-test', variantIndex: 7,
+});
+assert.deepEqual(cleanMetadata, { presetId: 'clean' }, 'clean must not generate fields after stripping');
+const sourceTitleMetadata = resolveEditorialMetadataPreset({
+  presetId: 'source-title', source, campaignId: 'metadata-test', variantIndex: 7,
+});
+assert.deepEqual(sourceTitleMetadata, {
+  presetId: 'source-title',
+  title: 'source-a',
+  comment: 'Local Creator Flow export',
+}, 'source-title must be derived from the source basename, not a random value');
+const projectMetadata = resolveEditorialMetadataPreset({
+  presetId: 'project-export', source, campaignId: 'metadata-test', variantIndex: 7,
+});
+assert.deepEqual(projectMetadata, {
+  presetId: 'project-export',
+  title: 'Creator Flow export 7',
+  comment: 'Local project export',
+}, 'project-export values must be deterministic and free from device/date fields');
+assert.deepEqual(
+  resolveEditorialMetadataPreset({
+    presetId: 'user-list', source, campaignId: 'metadata-test', variantIndex: 7,
+    title: 'Mapped title', comment: 'Mapped comment',
+  }),
+  { presetId: 'user-list', title: 'Mapped title', comment: 'Mapped comment' },
+  'user-list must preserve only explicit per-output title/comment values',
+);
+assert.throws(
+  () => resolveEditorialMetadataPreset({ presetId: 'user-list', source }),
+  /requires an explicit title/,
+  'user-list cannot create a title on its own',
+);
+assert.throws(
+  () => resolveEditorialMetadataPreset({ presetId: 'creation_time', source }),
+  /presetId is not supported/,
+  'platform-facing metadata preset IDs must be rejected',
+);
+
+const metadataRecipe = createEditorialRecipe({
+  source,
+  campaignId: 'metadata-test',
+  variantIndex: 7,
+  profileId: 'metadata-profile',
+  edits: { metadata: projectMetadata },
+});
+assert.deepEqual(metadataRecipe.edits.metadata, projectMetadata);
+assert.ok(metadataRecipe.materialChanges.includes('metadata-project-export'));
+assert.notEqual(
+  metadataRecipe.renderSignature,
+  createEditorialRecipe({
+    source, campaignId: 'metadata-test', variantIndex: 7, profileId: 'metadata-profile', edits: { metadata: cleanMetadata },
+  }).renderSignature,
+  'explicit metadata choices must be part of a transparent render signature',
+);
+const metadataArgs = buildFfmpegArgs(metadataRecipe, { outputPath: path.join(fixtures, 'output-metadata.mp4') });
+const metadataMapIndex = metadataArgs.indexOf('-map_metadata');
+const titleMetadataIndex = metadataArgs.indexOf('-metadata');
+assert.ok(metadataMapIndex >= 0 && metadataArgs[metadataMapIndex + 1] === '-1', 'metadata must be stripped before an explicit write');
+assert.ok(titleMetadataIndex > metadataMapIndex, 'explicit metadata must be written only after stripping');
+assert.deepEqual(metadataArgs.slice(titleMetadataIndex, titleMetadataIndex + 4), [
+  '-metadata', 'title=Creator Flow export 7', '-metadata', 'comment=Local project export',
+]);
+assert.equal(metadataArgs.some(value => /creation_time|encoder|device|uuid|identifier/i.test(value)), false,
+  'the export argv must not contain date, device, encoder, or identifier fields');
+const cleanMetadataArgs = buildFfmpegArgs(createEditorialRecipe({
+  source, campaignId: 'metadata-test', variantIndex: 8, profileId: 'metadata-profile', edits: { metadata: cleanMetadata },
+}), { outputPath: path.join(fixtures, 'output-clean-metadata.mp4') });
+assert.equal(cleanMetadataArgs.includes('-metadata'), false, 'clean exports must not write title/comment fields');
+assert.throws(
+  () => createEditorialRecipe({ source, edits: { metadata: { presetId: 'clean', title: 'Not allowed' } } }),
+  /must not contain title or comment/,
+  'clean metadata accepts no fields after stripping',
+);
+assert.throws(
+  () => createEditorialRecipe({ source, edits: { metadata: { presetId: 'user-list', title: 'Allowed', device: 'not allowed' } } }),
+  /not allowed/,
+  'metadata schema must reject every field outside presetId/title/comment',
+);
+assert.throws(
+  () => createEditorialRecipe({ source, edits: { metadata: { presetId: 'user-list', comment: 'No title' } } }),
+  /requires an explicit title/,
+  'user-list must receive an explicit title for the individual output',
+);
+assert.throws(
+  () => createEditorialRecipe({ source, edits: { metadata: { presetId: 'project-export', title: 'Only title' } } }),
+  /requires an explicit comment/,
+  'named metadata presets must include their explicit comment',
+);
+assert.throws(
+  () => createEditorialRecipe({ source, edits: { metadata: { presetId: 'user-list', title: 'x'.repeat(201) } } }),
+  /edits\.metadata\.title is too long/,
+  'metadata titles must have a strict bounded length',
+);
+assert.throws(
+  () => createEditorialRecipe({
+    source,
+    edits: { metadata: { presetId: 'user-list', title: 'Valid title', comment: 'x'.repeat(501) } },
+  }),
+  /edits\.metadata\.comment is too long/,
+  'metadata comments must have a strict bounded length',
 );
 
 assert.deepEqual(
