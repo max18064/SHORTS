@@ -19,6 +19,10 @@ const productionHashBefore = fs.existsSync(productionStatePath)
 const inputPath = path.join(process.cwd(), '.test-input.mp4');
 const outputPath = path.join(process.cwd(), '.test-output.mp4');
 const processingOutputPath = path.join(testStateDir, 'batch-processed.mp4');
+const campaignOutputOne = path.join(testStateDir, 'campaign-1.mp4');
+const campaignOutputTwo = path.join(testStateDir, 'campaign-2.mp4');
+const campaignVisualOutput = path.join(testStateDir, 'campaign-visual-1.mp4');
+const campaignOverlayPath = path.join(testStateDir, 'campaign-overlay.png');
 const bulkVideoPath = path.join(testStateDir, 'bulk-source.mp4');
 const channelAvatarPath = path.join(testStateDir, 'channel-avatar.png');
 const channelBannerPath = path.join(testStateDir, 'channel-banner.png');
@@ -448,6 +452,27 @@ try {
         updatedAt: '2026-01-01T00:00:00.000Z',
       }],
     }],
+    mediaCampaigns: [{
+      id: 'interrupted-campaign',
+      name: 'Interrupted campaign',
+      status: 'running',
+      outputCount: 1,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      assignments: [{
+        id: 'interrupted-campaign-assignment',
+        outputIndex: 1,
+        sourceName: 'source',
+        sourcePath: bulkVideoPath,
+        outputPath: processingOutputPath,
+        processingBatchId: 'interrupted-processing-batch',
+        processingItemId: 'interrupted-processing-item',
+        status: 'processing',
+        message: 'FFmpeg was working',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      }],
+    }],
   }));
   const recoveryProbe = `
     import { once } from 'node:events';
@@ -456,16 +481,18 @@ try {
     const { server } = await import('./server.js?recovery-probe=1');
     if (!server.listening) await once(server, 'listening');
     const address = server.address();
-    const [channelResponse, processingResponse] = await Promise.all([
+    const [channelResponse, processingResponse, campaignResponse] = await Promise.all([
       fetch('http://127.0.0.1:' + address.port + '/api/channels/tasks'),
       fetch('http://127.0.0.1:' + address.port + '/api/processing/batches'),
+      fetch('http://127.0.0.1:' + address.port + '/api/campaigns'),
     ]);
     const channelPayload = await channelResponse.json();
     const processingPayload = await processingResponse.json();
+    const campaignPayload = await campaignResponse.json();
     const retryResponse = await fetch('http://127.0.0.1:' + address.port + '/api/channels/tasks/interrupted-channel-task/run', { method: 'POST' });
     const retryTask = await retryResponse.json();
     const finalChannelPayload = await (await fetch('http://127.0.0.1:' + address.port + '/api/channels/tasks')).json();
-    const payload = { tasks: channelPayload.tasks, retryTask, finalTasks: finalChannelPayload.tasks, processing: processingPayload };
+    const payload = { tasks: channelPayload.tasks, retryTask, finalTasks: finalChannelPayload.tasks, processing: processingPayload, campaigns: campaignPayload.campaigns };
     await new Promise(resolve => server.close(resolve));
     previousLog(JSON.stringify(payload));
   `;
@@ -490,6 +517,9 @@ try {
   assert.equal(recoveredProbe.processing.batches.length, 1);
   assert.equal(recoveredProbe.processing.batches[0].status, 'needs-attention');
   assert.equal(recoveredProbe.processing.batches[0].items[0].status, 'recovery-needed');
+  assert.equal(recoveredProbe.campaigns.length, 1);
+  assert.equal(recoveredProbe.campaigns[0].status, 'needs-attention');
+  assert.equal(recoveredProbe.campaigns[0].assignments[0].status, 'recovery-needed');
   assert.equal(recoveredProbe.retryTask.status, 'manual-login-required');
   assert.equal(recoveredProbe.finalTasks.find(task => task.id === 'interrupted-channel-task').status, 'manual-login-required');
   assert.ok(localDolphinCalls.some(call => call.profileId === 'recovery-profile'));
@@ -517,6 +547,122 @@ try {
     assert.equal(streamedItem.source, 'uploaded');
     assert.equal(streamedItem.hasVideo, true);
     assert.ok(fs.existsSync(streamedItem.filePath));
+    const noProfilesCampaignResponse = await fetch(`${base}/api/campaigns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourcePaths: [streamedItem.filePath],
+        outputCount: 2,
+        outputFolder: testStateDir,
+        outputTemplate: 'campaign-{index}.mp4',
+        recipe: { layout: 'keep', crop: 'none', speedMin: 0.98, speedMax: 1.02, audioMode: 'original', metadataMode: 'clean', addToLibrary: false },
+        profileIds: [],
+        distributionEnabled: false,
+        titleTemplate: '',
+        descriptionTemplate: '',
+        tags: [],
+        autoStart: false,
+        processingConcurrency: 2,
+        uploadConcurrency: 1,
+      }),
+    });
+    assert.equal(noProfilesCampaignResponse.status, 201);
+    const noProfilesCampaign = (await noProfilesCampaignResponse.json()).campaign;
+    assert.equal(noProfilesCampaign.outputCount, 2);
+    assert.equal(noProfilesCampaign.distributionEnabled, false);
+    assert.deepEqual(noProfilesCampaign.profileIds, []);
+    assert.equal(noProfilesCampaign.assignments.length, 2);
+    assert.ok(noProfilesCampaign.assignments.every(item => item.status === 'queued' && item.recipe?.recipeId));
+    assert.notEqual(noProfilesCampaign.assignments[0].recipe.renderSignature, noProfilesCampaign.assignments[1].recipe.renderSignature);
+    const collidingCampaign = await fetch(`${base}/api/campaigns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourcePaths: [streamedItem.filePath], outputCount: 2, outputFolder: testStateDir, outputTemplate: 'campaign-{index}.mp4',
+        recipe: { layout: 'keep', crop: 'none', speedMin: 0.98, speedMax: 1.02, audioMode: 'original', metadataMode: 'clean' },
+        distributionEnabled: false,
+      }),
+    });
+    assert.equal(collidingCampaign.status, 409);
+    assert.equal((await collidingCampaign.json()).code, 'campaign-output-reserved');
+    const campaignList = await (await fetch(`${base}/api/campaigns`)).json();
+    assert.equal(campaignList.campaigns[0].id, noProfilesCampaign.id);
+    const invalidCampaignRecipe = await fetch(`${base}/api/campaigns`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourcePaths: [streamedItem.filePath], outputCount: 1, outputFolder: testStateDir, outputTemplate: 'invalid-{index}.mp4',
+        recipe: { metadataMode: 'keep' }, distributionEnabled: false,
+      }),
+    });
+    assert.equal(invalidCampaignRecipe.status, 422);
+    const runCampaignResponse = await fetch(`${base}/api/campaigns/${noProfilesCampaign.id}/run`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
+    });
+    assert.equal(runCampaignResponse.status, 202);
+    let renderedCampaign = null;
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      renderedCampaign = (await (await fetch(`${base}/api/campaigns/${noProfilesCampaign.id}`)).json()).campaign;
+      if (renderedCampaign.status === 'completed' || renderedCampaign.status === 'needs-attention') break;
+    }
+    assert.equal(renderedCampaign.status, 'completed');
+    assert.ok(fs.existsSync(campaignOutputOne));
+    assert.ok(fs.existsSync(campaignOutputTwo));
+    assert.ok(renderedCampaign.assignments.every(item => item.status === 'completed'));
+
+    // A real local render through the complete visual-editorial path.  This
+    // remains inside the isolated state directory: no Dolphin profile,
+    // browser, user library or user media is accessed by this test.
+    await execFileAsync(process.env.FFMPEG_PATH || 'ffmpeg', [
+      '-y', '-f', 'lavfi', '-i', 'color=c=white@0.7:s=32x32:d=0.1',
+      '-vf', 'format=rgba', '-frames:v', '1', campaignOverlayPath,
+    ]);
+    const visualCampaignResponse = await fetch(`${base}/api/campaigns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sourcePaths: [streamedItem.filePath],
+        outputCount: 1,
+        outputFolder: testStateDir,
+        outputTemplate: 'campaign-visual-{index}.mp4',
+        recipe: {
+          layout: 'keep', crop: 'none', speedMin: 1, speedMax: 1,
+          overlayPath: campaignOverlayPath, overlayOpacity: 0.65, overlayPosition: 'top-left', overlayWidth: 32,
+          overlayBlurMin: 2, overlayBlurMax: 2,
+          textVariations: ['Проверка: видимый текст'],
+          fontPath: 'C:\\Windows\\Fonts\\arial.ttf', textSize: 20, textY: 75, textColorMode: 'accent', textOutline: true,
+          fps: 24, bitrateKbps: 700,
+          colorCorrectionEnabled: true, colorStrength: 45,
+          audioMode: 'original', metadataMode: 'clean', addToLibrary: false,
+        },
+        distributionEnabled: false, profileIds: [], autoStart: false,
+        processingConcurrency: 1, uploadConcurrency: 1,
+      }),
+    });
+    assert.equal(visualCampaignResponse.status, 201);
+    const visualCampaign = (await visualCampaignResponse.json()).campaign;
+    const visualRecipe = visualCampaign.assignments[0].recipe;
+    assert.equal(visualRecipe.edits.text.value, 'Проверка: видимый текст');
+    assert.equal(visualRecipe.edits.text.yPercent, 75);
+    assert.equal(visualRecipe.edits.overlay.position, 'top-left');
+    assert.ok(visualRecipe.edits.overlay.blur > 0);
+    assert.equal(visualRecipe.edits.color.amount, 45);
+    assert.equal(visualRecipe.edits.video.fps, 24);
+    assert.equal(visualRecipe.edits.video.bitrateKbps, 700);
+    assert.ok(visualRecipe.materialChanges.some(change => change.startsWith('text-')));
+    const visualRun = await fetch(`${base}/api/campaigns/${visualCampaign.id}/run`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
+    });
+    assert.equal(visualRun.status, 202);
+    let renderedVisualCampaign = null;
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      renderedVisualCampaign = (await (await fetch(`${base}/api/campaigns/${visualCampaign.id}`)).json()).campaign;
+      if (renderedVisualCampaign.status === 'completed' || renderedVisualCampaign.status === 'needs-attention') break;
+    }
+    assert.equal(renderedVisualCampaign.status, 'completed', JSON.stringify(renderedVisualCampaign.assignments[0]));
+    assert.ok(fs.existsSync(campaignVisualOutput));
+    assert.equal(renderedVisualCampaign.assignments[0].status, 'completed');
     const invalidProcessingBatch = await fetch(`${base}/api/processing/batches`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ jobs: [{ inputPath: streamedItem.filePath, outputPath: path.join(testStateDir, 'not-an-mp4.mov') }] }),
@@ -534,8 +680,9 @@ try {
     assert.equal(processingBatch.batch.items[0].status, 'queued');
     assert.equal(processingBatch.processor.limit, 3);
     const processingBatches = await (await fetch(`${base}/api/processing/batches`)).json();
-    assert.equal(processingBatches.batches.length, 1);
-    assert.equal(processingBatches.batches[0].items[0].outputPath, processingOutputPath);
+    assert.ok(processingBatches.batches.length >= 2);
+    const standaloneProcessingBatch = processingBatches.batches.find(batch => batch.id === processingBatch.batch.id);
+    assert.equal(standaloneProcessingBatch.items[0].outputPath, processingOutputPath);
     const startedProcessingBatch = await fetch(`${base}/api/processing/batches/${processingBatch.batch.id}/run`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
     });
@@ -556,6 +703,10 @@ try {
   fs.rmSync(inputPath, { force: true });
   fs.rmSync(outputPath, { force: true });
   fs.rmSync(processingOutputPath, { force: true });
+  fs.rmSync(campaignOutputOne, { force: true });
+  fs.rmSync(campaignOutputTwo, { force: true });
+  fs.rmSync(campaignVisualOutput, { force: true });
+  fs.rmSync(campaignOverlayPath, { force: true });
   fs.rmSync(bulkVideoPath, { force: true });
   fs.rmSync(channelAvatarPath, { force: true });
   fs.rmSync(channelBannerPath, { force: true });

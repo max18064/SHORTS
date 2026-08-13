@@ -11,10 +11,21 @@ const MAX_PATH_LENGTH = 4_096;
 const MAX_ID_LENGTH = 160;
 const MAX_DIMENSION = 7_680;
 const MAX_OVERLAY_MARGIN = 2_000;
+const MAX_TEXT_LENGTH = 280;
+const MAX_TEXT_SIZE = 512;
+const MAX_TEXT_OUTLINE = 32;
 const MIN_PACE = 0.95;
 const MAX_PACE = 1.05;
 const AUDIO_MODES = new Set(['keep', 'mute', 'gain', 'mix']);
 const OVERLAY_POSITIONS = new Set(['top-left', 'top-right', 'bottom-left', 'bottom-right', 'center']);
+const TEXT_POSITIONS = new Set([
+  'top-left', 'top', 'top-center', 'top-right',
+  'left', 'center', 'right',
+  'bottom-left', 'bottom', 'bottom-center', 'bottom-right',
+]);
+const COLOR_CORRECTION_LEVELS = new Set(['off', 'weak', 'medium', 'strong']);
+const FONT_EXTENSIONS = new Set(['.otf', '.ttf']);
+const HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
 const CROP_ASPECTS = Object.freeze({
   '1:1': { numerator: 1, denominator: 1 },
   '4:5': { numerator: 4, denominator: 5 },
@@ -74,6 +85,25 @@ function normalizedNumber(value, label, { min = -Number.MAX_VALUE, max = Number.
     throw recipeError(`${label} must be a number between ${min} and ${max}.`);
   }
   return Math.round(value * 10_000) / 10_000;
+}
+
+function normalizedHexColor(value, label, { defaultValue = undefined } = {}) {
+  const rawValue = value === undefined || value === null || value === '' ? defaultValue : value;
+  const color = normalizedText(rawValue, label, { required: true, maxLength: 7 });
+  if (!HEX_COLOR.test(color)) {
+    throw recipeError(`${label} must be a #RRGGBB color.`);
+  }
+  return color.toUpperCase();
+}
+
+function normalizedRange(value, label, { min = 0, max = 1 } = {}) {
+  const range = asPlainObject(value, label);
+  const minimum = normalizedNumber(range.min, `${label}.min`, { min, max });
+  const maximum = normalizedNumber(range.max, `${label}.max`, { min, max });
+  if (minimum > maximum) {
+    throw recipeError(`${label}.min must not exceed ${label}.max.`);
+  }
+  return { min: minimum, max: maximum };
 }
 
 function normalizedEvenDimension(value, label) {
@@ -142,18 +172,132 @@ function normalizeScale(rawScale) {
   };
 }
 
-function normalizeOverlay(rawOverlay) {
+function resolveBoundedValue(bounds, variationSeed, label) {
+  if (bounds.min === bounds.max) return bounds.min;
+  // The seed is an explicit recipe identity, not a device/browser value. This
+  // keeps each output reproducible and makes the chosen setting auditable.
+  const unit = hashInteger({ kind: 'editorial-bounded-value', label, variationSeed, bounds }) / 0xffffffff;
+  return Math.round((bounds.min + ((bounds.max - bounds.min) * unit)) * 10_000) / 10_000;
+}
+
+function normalizeOptionalBlur(rawBlur, rawBounds, variationSeed) {
+  if (rawBlur === undefined || rawBlur === null || rawBlur === '') {
+    if (rawBounds !== undefined) {
+      throw recipeError('edits.overlay.blur must be present when edits.overlay.blurBounds is supplied.');
+    }
+    return {};
+  }
+
+  const isRange = rawBlur && typeof rawBlur === 'object' && !Array.isArray(rawBlur);
+  if (isRange && rawBounds !== undefined) {
+    throw recipeError('Use either edits.overlay.blur as a range or blurBounds with a resolved blur value.');
+  }
+  if (isRange) {
+    const blurBounds = normalizedRange(rawBlur, 'edits.overlay.blur', { min: 0, max: 1 });
+    return {
+      blur: resolveBoundedValue(blurBounds, variationSeed, 'overlay.blur'),
+      blurBounds,
+    };
+  }
+
+  const blur = normalizedNumber(rawBlur, 'edits.overlay.blur', { min: 0, max: 1 });
+  if (rawBounds === undefined || rawBounds === null || rawBounds === '') return { blur };
+  const blurBounds = normalizedRange(rawBounds, 'edits.overlay.blurBounds', { min: 0, max: 1 });
+  if (blur < blurBounds.min || blur > blurBounds.max) {
+    throw recipeError('edits.overlay.blur must stay within edits.overlay.blurBounds.');
+  }
+  return { blur, blurBounds };
+}
+
+function normalizeOverlay(rawOverlay, variationSeed) {
   if (rawOverlay === undefined || rawOverlay === null || rawOverlay === false) return null;
   const overlay = asPlainObject(rawOverlay, 'edits.overlay');
   const position = normalizedText(overlay.position ?? 'bottom-right', 'edits.overlay.position', { required: true, maxLength: 24 });
   if (!OVERLAY_POSITIONS.has(position)) throw recipeError('edits.overlay.position is not supported.');
-  return {
+  const normalized = {
     filePath: normalizedPath(overlay.filePath, 'edits.overlay.filePath', { extensions: new Set(['.png']) }),
     position,
     opacity: normalizedNumber(overlay.opacity ?? 1, 'edits.overlay.opacity', { min: 0.05, max: 1 }),
     width: normalizedEvenDimension(overlay.width, 'edits.overlay.width'),
     margin: normalizedInteger(overlay.margin ?? 24, 'edits.overlay.margin', { min: 0, max: MAX_OVERLAY_MARGIN }),
   };
+  return { ...normalized, ...normalizeOptionalBlur(overlay.blur, overlay.blurBounds, variationSeed) };
+}
+
+function normalizeTextOutline(rawOutline) {
+  if (rawOutline === undefined || rawOutline === null || rawOutline === false) return null;
+  if (rawOutline === true) return { color: '#000000', width: 3 };
+  const outline = asPlainObject(rawOutline, 'edits.text.outline');
+  return {
+    color: normalizedHexColor(outline.color, 'edits.text.outline.color', { defaultValue: '#000000' }),
+    width: normalizedInteger(outline.width ?? 3, 'edits.text.outline.width', { min: 1, max: MAX_TEXT_OUTLINE }),
+  };
+}
+
+function normalizeText(rawText) {
+  if (rawText === undefined || rawText === null || rawText === false) return null;
+  const text = asPlainObject(rawText, 'edits.text');
+  if (text.value !== undefined && text.text !== undefined && text.value !== text.text) {
+    throw recipeError('Use only one of edits.text.value or edits.text.text.');
+  }
+  const value = normalizedText(text.value ?? text.text, 'edits.text.value', { required: true, maxLength: MAX_TEXT_LENGTH });
+  const position = normalizedText(text.position ?? 'bottom-center', 'edits.text.position', { required: true, maxLength: 24 });
+  if (!TEXT_POSITIONS.has(position)) throw recipeError('edits.text.position is not supported.');
+  const normalized = {
+    value,
+    fontFile: normalizedPath(text.fontFile, 'edits.text.fontFile', { extensions: FONT_EXTENSIONS }),
+    size: normalizedInteger(text.size, 'edits.text.size', { min: 8, max: MAX_TEXT_SIZE }),
+    position,
+    color: normalizedHexColor(text.color, 'edits.text.color', { defaultValue: '#FFFFFF' }),
+    outline: normalizeTextOutline(text.outline),
+    margin: normalizedInteger(text.margin ?? 48, 'edits.text.margin', { min: 0, max: MAX_OVERLAY_MARGIN }),
+  };
+  if (text.yPercent !== undefined && text.yPercent !== null && text.yPercent !== '') {
+    normalized.yPercent = normalizedNumber(text.yPercent, 'edits.text.yPercent', { min: 5, max: 95 });
+  }
+  return normalized;
+}
+
+function normalizeColor(rawColor) {
+  if (rawColor === undefined || rawColor === null || rawColor === '') return null;
+  if (typeof rawColor === 'string') {
+    const level = normalizedText(rawColor, 'edits.color', { required: true, maxLength: 12 });
+    if (!COLOR_CORRECTION_LEVELS.has(level)) throw recipeError('edits.color is not supported.');
+    return level === 'off' ? null : level;
+  }
+  const color = asPlainObject(rawColor, 'edits.color');
+  const level = normalizedText(color.level ?? 'medium', 'edits.color.level', { required: true, maxLength: 12 });
+  if (!COLOR_CORRECTION_LEVELS.has(level)) throw recipeError('edits.color is not supported.');
+  if (level === 'off') return null;
+  return {
+    level,
+    // A slider value is kept verbatim in the recipe and scales the declared
+    // correction below.  It is an editorial control, never a hidden change.
+    amount: normalizedNumber(color.amount ?? 100, 'edits.color.amount', { min: 0, max: 100 }),
+  };
+}
+
+function normalizeVideo(rawVideo) {
+  if (rawVideo === undefined || rawVideo === null || rawVideo === false) return null;
+  const video = asPlainObject(rawVideo, 'edits.video');
+  const result = {};
+  if (video.fps !== undefined && video.fps !== null && video.fps !== '') {
+    result.fps = normalizedInteger(video.fps, 'edits.video.fps', { min: 12, max: 120 });
+  }
+  if (video.bitrateKbps !== undefined && video.bitrateKbps !== null && video.bitrateKbps !== '') {
+    result.bitrateKbps = normalizedInteger(video.bitrateKbps, 'edits.video.bitrateKbps', { min: 100, max: 100_000 });
+  }
+  if (video.quality !== undefined && video.quality !== null && video.quality !== '') {
+    const quality = normalizedText(video.quality, 'edits.video.quality', { required: true, maxLength: 16 });
+    if (!new Set(['low', 'medium', 'high']).has(quality)) {
+      throw recipeError('edits.video.quality is not supported.');
+    }
+    result.quality = quality;
+  }
+  if (result.bitrateKbps && result.quality) {
+    throw recipeError('Use edits.video.bitrateKbps or edits.video.quality, not both.');
+  }
+  return Object.keys(result).length ? result : null;
 }
 
 function normalizeAudio(rawAudio, source, pace) {
@@ -184,7 +328,7 @@ function normalizeAudio(rawAudio, source, pace) {
  * Validate and normalize visible editorial edits.  All returned values are
  * explicit, so they can be shown in a UI and stored in a job manifest.
  */
-export function normalizeEditorialEdits(rawEdits = {}, { source } = {}) {
+export function normalizeEditorialEdits(rawEdits = {}, { source, variationSeed = { kind: 'direct-editorial-edits' } } = {}) {
   const edits = asPlainObject(rawEdits, 'edits');
   const normalizedSource = source ? normalizeSource(source) : null;
   const pace = normalizedNumber(edits.pace ?? 1, 'edits.pace', { min: MIN_PACE, max: MAX_PACE });
@@ -192,13 +336,22 @@ export function normalizeEditorialEdits(rawEdits = {}, { source } = {}) {
     throw recipeError('A source with hasAudio is required to validate these audio edits.');
   }
 
-  return {
+  const normalized = {
     crop: normalizeCrop(edits.crop),
     scale: normalizeScale(edits.scale),
-    overlay: normalizeOverlay(edits.overlay),
+    overlay: normalizeOverlay(edits.overlay, variationSeed),
     pace,
     audio: normalizeAudio(edits.audio, normalizedSource || { hasAudio: null }, pace),
   };
+  const text = normalizeText(edits.text);
+  const color = normalizeColor(edits.color);
+  const video = normalizeVideo(edits.video);
+  // Omit inactive new fields.  This preserves the signed form of recipes
+  // created before these optional controls existed.
+  if (text) normalized.text = text;
+  if (color) normalized.color = color;
+  if (video) normalized.video = video;
+  return normalized;
 }
 
 function materialChanges(edits) {
@@ -206,6 +359,16 @@ function materialChanges(edits) {
   if (edits.crop) changes.push(`crop-${edits.crop.aspect}-${edits.crop.position}`);
   if (edits.scale) changes.push(`scale-${edits.scale.width}x${edits.scale.height}-${edits.scale.fit}`);
   if (edits.overlay) changes.push(`overlay-${edits.overlay.position}-${Math.round(edits.overlay.opacity * 100)}pct`);
+  if (edits.overlay?.blur > 0) changes.push(`overlay-blur-${decimal(edits.overlay.blur)}`);
+  if (edits.text) changes.push(`text-${edits.text.position}-${edits.text.size}px`);
+  if (edits.color) {
+    const colorLevel = typeof edits.color === 'string' ? edits.color : edits.color.level;
+    const colorAmount = typeof edits.color === 'string' ? null : edits.color.amount;
+    changes.push(colorAmount === null ? `color-${colorLevel}` : `color-${colorLevel}-${decimal(colorAmount)}pct`);
+  }
+  if (edits.video?.fps) changes.push(`fps-${edits.video.fps}`);
+  if (edits.video?.bitrateKbps) changes.push(`bitrate-${edits.video.bitrateKbps}k`);
+  if (edits.video?.quality) changes.push(`quality-${edits.video.quality}`);
   if (edits.pace !== 1) changes.push(`pace-${decimal(edits.pace)}x`);
   if (edits.audio.mode === 'mute') changes.push('audio-muted');
   if (edits.audio.mode === 'gain') changes.push(`audio-gain-${decimal(edits.audio.gainDb)}db`);
@@ -237,7 +400,16 @@ export function createEditorialRecipe({ source, campaignId = '', variantIndex = 
   const normalizedCampaignId = normalizedText(campaignId, 'campaignId', { maxLength: MAX_ID_LENGTH });
   const normalizedVariantIndex = normalizedInteger(variantIndex, 'variantIndex', { min: 1, max: MAX_EDITORIAL_CAMPAIGN_OUTPUTS });
   const normalizedProfileId = normalizedText(profileId, 'profileId', { required: true, maxLength: MAX_ID_LENGTH });
-  const normalizedEdits = normalizeEditorialEdits(edits, { source: normalizedSource });
+  const normalizedEdits = normalizeEditorialEdits(edits, {
+    source: normalizedSource,
+    variationSeed: {
+      campaignId: normalizedCampaignId,
+      sourceId: normalizedSource.id,
+      sourcePath: normalizedSource.filePath,
+      variantIndex: normalizedVariantIndex,
+      profileId: normalizedProfileId,
+    },
+  });
   const identity = recipeIdentity({
     source: normalizedSource,
     campaignId: normalizedCampaignId,
@@ -386,6 +558,96 @@ function overlayCoordinates(position, margin) {
   }
 }
 
+function textCoordinates(position, margin) {
+  const centeredX = '(w-text_w)/2';
+  const centeredY = '(h-text_h)/2';
+  const rightX = `w-text_w-${margin}`;
+  const bottomY = `h-text_h-${margin}`;
+  switch (position) {
+    case 'top-left': return [String(margin), String(margin)];
+    case 'top':
+    case 'top-center': return [centeredX, String(margin)];
+    case 'top-right': return [rightX, String(margin)];
+    case 'left': return [String(margin), centeredY];
+    case 'center': return [centeredX, centeredY];
+    case 'right': return [rightX, centeredY];
+    case 'bottom-left': return [String(margin), bottomY];
+    case 'bottom':
+    case 'bottom-center': return [centeredX, bottomY];
+    case 'bottom-right': return [rightX, bottomY];
+    default: throw recipeError('Unsupported text position.');
+  }
+}
+
+function escapeFilterValue(value) {
+  // Escaping is for FFmpeg's filtergraph parser only.  `buildFfmpegArgs`
+  // returns argv for execFile(), so no input here is ever interpreted by a
+  // command shell.
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/:/g, '\\:')
+    .replace(/,/g, '\\,')
+    .replace(/;/g, '\\;')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]');
+}
+
+function escapeDrawtextFontPath(value) {
+  // On Windows drawtext parses a drive colon as an option separator.  Forward
+  // slashes make the path unambiguous to FFmpeg, then the drive colon is
+  // escaped exactly once for the filter parser.  Text itself still uses the
+  // broader escaping above because a backslash can be visible content there.
+  return String(value)
+    .replace(/\\/g, '/')
+    .replace(/'/g, "\\'")
+    .replace(/:/g, '\\:')
+    .replace(/,/g, '\\,')
+    .replace(/;/g, '\\;')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]');
+}
+
+function drawtextFilter(text) {
+  const outline = text.outline
+    ? `:borderw=${text.outline.width}:bordercolor=0x${text.outline.color.slice(1)}`
+    : '';
+  const [x, fallbackY] = textCoordinates(text.position, text.margin);
+  const y = text.yPercent === undefined
+    ? fallbackY
+    : `h*${decimal(text.yPercent / 100)}-text_h/2`;
+  return `drawtext=fontfile='${escapeDrawtextFontPath(text.fontFile)}':text='${escapeFilterValue(text.value)}':expansion=none:fontsize=${text.size}:fontcolor=0x${text.color.slice(1)}${outline}:x=${x}:y=${y}`;
+}
+
+function colorCorrectionFilter(color) {
+  const level = typeof color === 'string' ? color : color.level;
+  const amount = typeof color === 'string' ? 100 : color.amount;
+  const presets = {
+    weak: { contrast: 0.03, brightness: 0.005, saturation: 0.04, gamma: 0.01 },
+    medium: { contrast: 0.07, brightness: 0.01, saturation: 0.09, gamma: 0.03 },
+    strong: { contrast: 0.12, brightness: 0.015, saturation: 0.15, gamma: 0.05 },
+  };
+  const preset = presets[level];
+  if (!preset) throw recipeError('Unsupported color correction level.');
+  const multiplier = amount / 100;
+  return `eq=contrast=${decimal(1 + (preset.contrast * multiplier))}:brightness=${decimal(preset.brightness * multiplier)}:saturation=${decimal(1 + (preset.saturation * multiplier))}:gamma=${decimal(1 + (preset.gamma * multiplier))}`;
+}
+
+function overlayBlurFilter(blur) {
+  if (!blur || blur <= 0) return '';
+  // The user-facing 0..1 amount maps openly to a bounded box-blur radius.
+  // The chosen value is stored in the recipe as edits.overlay.blur.
+  const radius = Math.max(1, Math.round(blur * 24));
+  return `,boxblur=luma_radius=${radius}:luma_power=1:chroma_radius=${radius}:chroma_power=1`;
+}
+
+function qualityCrf(quality) {
+  if (quality === 'low') return '24';
+  if (quality === 'medium') return '20';
+  if (quality === 'high') return '18';
+  return '20';
+}
+
 /**
  * Turn a validated recipe into an argv array for child_process.execFile().
  * This function never invokes a shell.  It always removes container metadata
@@ -427,14 +689,17 @@ export function buildFfmpegArgs(recipe, { outputPath, overwrite = false } = {}) 
   if (edits.pace !== 1) addVideoFilter(`setpts=PTS/${decimal(edits.pace)}`);
   if (edits.crop) addVideoFilter(cropFilter(edits.crop));
   if (edits.scale) addVideoFilter(scaleFilter(edits.scale));
+  if (edits.color) addVideoFilter(colorCorrectionFilter(edits.color));
+  if (edits.video?.fps) addVideoFilter(`fps=fps=${edits.video.fps}`);
   if (edits.overlay) {
     const overlayLabel = `[overlay${nextVideoLabel}]`;
     const outputLabel = `[v${nextVideoLabel}]`;
     nextVideoLabel += 1;
-    filters.push(`[${overlayInput}:v]scale=${edits.overlay.width}:-1,format=rgba,colorchannelmixer=aa=${decimal(edits.overlay.opacity)}${overlayLabel}`);
+    filters.push(`[${overlayInput}:v]scale=${edits.overlay.width}:-1,format=rgba,colorchannelmixer=aa=${decimal(edits.overlay.opacity)}${overlayBlurFilter(edits.overlay.blur)}${overlayLabel}`);
     filters.push(`${videoLabel}${overlayLabel}overlay=${overlayCoordinates(edits.overlay.position, edits.overlay.margin)}:format=auto${outputLabel}`);
     videoLabel = outputLabel;
   }
+  if (edits.text) addVideoFilter(drawtextFilter(edits.text));
 
   let audioMap = null;
   if (edits.audio.mode !== 'mute') {
@@ -467,9 +732,14 @@ export function buildFfmpegArgs(recipe, { outputPath, overwrite = false } = {}) 
     '-map_chapters', '-1',
     '-c:v', 'libx264',
     '-preset', 'medium',
-    '-crf', '20',
-    '-pix_fmt', 'yuv420p',
   );
+  if (edits.video?.bitrateKbps) {
+    const bitrate = `${edits.video.bitrateKbps}k`;
+    args.push('-b:v', bitrate, '-maxrate', bitrate, '-bufsize', `${edits.video.bitrateKbps * 2}k`);
+  } else {
+    args.push('-crf', qualityCrf(edits.video?.quality));
+  }
+  args.push('-pix_fmt', 'yuv420p');
   if (edits.audio.mode === 'mute') {
     args.push('-an');
   } else {

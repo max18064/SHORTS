@@ -1,11 +1,12 @@
 const state = {
   health: null, profiles: [], tasks: [], library: [], channelTasks: [], logs: [], proxies: [],
   settings: null, worker: null, accountStates: new Map(), analytics: new Map(), studioBatches: [], accountBatches: [],
-  bulkProfileIds: new Set(), channelBulkProfileIds: new Set(), folders: [], processingBatches: [], processingProcessor: null,
+  bulkProfileIds: new Set(), channelBulkProfileIds: new Set(), campaignProfileIds: new Set(), folders: [], processingBatches: [], processingProcessor: null,
+  campaigns: [], campaignApiAvailable: null,
 };
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
-const pageNames = { overview: 'Главная', profiles: 'Профили Dolphin', accounts: 'Аккаунты YouTube', queue: 'Очередь задач', library: 'Библиотека', channels: 'Каналы', processing: 'Обработка', analytics: 'Аналитика', settings: 'Настройки' };
+const pageNames = { overview: 'Главная', profiles: 'Профили Dolphin', accounts: 'Аккаунты YouTube', campaign: 'Уникализатор', queue: 'Очередь задач', library: 'Библиотека', channels: 'Каналы', processing: 'Обработка', analytics: 'Аналитика', settings: 'Настройки' };
 
 async function api(url, options = {}) {
   const response = await fetch(url, options);
@@ -107,7 +108,7 @@ function taskStatusLabel(status) {
   const labels = {
     queued: 'в очереди', scheduled: 'запланирована', starting: 'подготовка профиля', 'starting-profile': 'подготовка профиля', applying: 'применение изменений', 'profile-ready': 'готова к загрузке',
     uploading: 'загрузка в Studio', 'manual-login-required': 'нужен вход', 'login-ready': 'вход подтверждён',
-    'awaiting-review': 'на проверке', running: 'обрабатывается', completed: 'выполнена', cancelled: 'отменена', error: 'ошибка', 'recovery-needed': 'требует проверки', 'needs-attention': 'требует проверки', 'completed-with-errors': 'есть ошибки',
+    'awaiting-review': 'на проверке', running: 'обрабатывается', processing: 'обработка версий', preparing: 'подготовка', distributing: 'распределение', prepared: 'подготовлена', 'ready-for-upload': 'в плане загрузки', uploading: 'загрузка в Studio', completed: 'выполнена', cancelled: 'отменена', error: 'ошибка', 'recovery-needed': 'требует проверки', 'needs-attention': 'требует проверки', 'completed-with-errors': 'есть ошибки',
   };
   return labels[status] || status || 'неизвестно';
 }
@@ -126,6 +127,7 @@ function activatePage(id) {
   if (id === 'accounts') Promise.all([loadAccounts(), loadAccountBatches()]).catch(() => renderAccounts());
   if (id === 'analytics') Promise.all([refreshAnalyticsView(), loadStudioBatches()]).catch(() => {});
   if (id === 'processing') Promise.all([loadProcessingBatches(), loadLibrary()]).catch(() => {});
+  if (id === 'campaign') Promise.all([loadCampaigns(), loadLibrary(), loadProfiles(), loadAccounts()]).catch(() => {});
   if (id === 'settings') refreshSettings().catch(() => {});
 }
 
@@ -160,6 +162,353 @@ function renderProcessingInputPicker() {
   select.onchange = () => { counter.textContent = `Выбрано: ${[...select.selectedOptions].length}`; };
 }
 
+function videoLibraryItems() {
+  return state.library.filter(item => item && item.hasVideo !== false && item.filePath);
+}
+
+function campaignNameFromPath(value) {
+  return String(value || 'ролик').replace(/^.*[\\/]/, '').replace(/\.[^.]+$/, '') || 'ролик';
+}
+
+function updateCampaignPlan() {
+  const target = $('#campaign-plan');
+  const sourceSelect = $('#campaign-inputs');
+  const outputInput = $('#campaign-output-count');
+  if (!target || !sourceSelect || !outputInput) return;
+  const sourceCount = [...sourceSelect.selectedOptions].length;
+  const outputs = Math.max(0, Math.floor(Number(outputInput.value) || 0));
+  const distributionEnabled = Boolean($('#campaign-enable-distribution')?.checked);
+  const profiles = state.campaignProfileIds.size;
+  if (!sourceCount || !outputs) {
+    target.innerHTML = 'Выберите исходники и укажите количество готовых роликов, чтобы увидеть план кампании.';
+    updateCampaignRecipeSummary();
+    return;
+  }
+  const base = Math.floor(outputs / sourceCount);
+  const extra = outputs % sourceCount;
+  const distribution = !distributionEnabled
+    ? 'Сначала будет выполнена только обработка версий; распределение по каналам не включено.'
+    : profiles
+    ? `На ${profiles} выбранных профилей будет назначено в среднем ${Math.floor(outputs / profiles)}${outputs % profiles ? '–' + Math.ceil(outputs / profiles) : ''} ролика на профиль.`
+    : 'Выберите профили ниже, чтобы задать распределение загрузок.';
+  target.innerHTML = `<b>План:</b> ${outputs} готовых роликов из ${sourceCount} источн${sourceCount === 1 ? 'ика' : sourceCount < 5 ? 'иков' : 'иков'}: по ${base}${extra ? `, ещё ${extra} источн${extra === 1 ? 'ик получит' : 'ика получат'} на один результат больше` : ''}.<br>${escapeHtml(distribution)}`;
+  updateCampaignRecipeSummary();
+}
+
+function renderCampaignSourcePicker() {
+  const select = $('#campaign-inputs');
+  const counter = $('#campaign-source-count');
+  if (!select || !counter) return;
+  const previous = new Set([...select.selectedOptions].map(option => option.value));
+  const items = videoLibraryItems();
+  select.innerHTML = items.map(item => `<option value="${escapeHtml(item.filePath)}" ${previous.has(item.filePath) ? 'selected' : ''}>${escapeHtml(item.fileName)} · ${formatDuration(item.durationSeconds)}</option>`).join('');
+  counter.textContent = `Выбрано: ${[...select.selectedOptions].length}`;
+  select.onchange = () => {
+    counter.textContent = `Выбрано: ${[...select.selectedOptions].length}`;
+    updateCampaignPlan();
+  };
+  updateCampaignPlan();
+}
+
+function campaignProfileIsConnected(profile) {
+  return state.accountStates.get(profileIdOf(profile))?.status === 'connected';
+}
+
+function renderCampaignProfilePicker() {
+  const target = $('#campaign-profile-picker');
+  const counter = $('#campaign-profile-count');
+  if (!target || !counter) return;
+  const ids = state.profiles.map(profileIdOf);
+  const selected = state.campaignProfileIds;
+  counter.textContent = `Выбрано: ${selected.size} из ${ids.length}`;
+  if (!ids.length) {
+    target.innerHTML = '<div class="empty">Сначала подключите хотя бы один профиль Dolphin.</div>';
+    updateCampaignPlan();
+    return;
+  }
+  target.innerHTML = state.profiles.map(profile => {
+    const id = profileIdOf(profile);
+    const present = accountPresentation(profile);
+    const connected = campaignProfileIsConnected(profile);
+    return `<label class="bulk-profile-option campaign-profile-option" data-connected="${connected}"><input type="checkbox" value="${escapeHtml(id)}" ${selected.has(id) ? 'checked' : ''}><span class="profile-avatar ${present.tone === 'warn' ? 'warning' : present.tone === 'bad' ? 'error' : ''}">${escapeHtml(profileInitials(profile))}</span><span class="bulk-profile-copy"><b>${escapeHtml(profileNameOf(profile))}</b><small>${connected ? 'YouTube подключён' : escapeHtml(present.label)}</small></span></label>`;
+  }).join('');
+  target.querySelectorAll('input[type="checkbox"]').forEach(input => {
+    input.onchange = () => {
+      if (input.checked) state.campaignProfileIds.add(input.value);
+      else state.campaignProfileIds.delete(input.value);
+      counter.textContent = `Выбрано: ${state.campaignProfileIds.size} из ${ids.length}`;
+      updateCampaignPlan();
+    };
+  });
+  updateCampaignPlan();
+}
+
+function setCampaignProfiles(mode) {
+  if (mode === 'none') state.campaignProfileIds = new Set();
+  else if (mode === 'connected') state.campaignProfileIds = new Set(state.profiles.filter(campaignProfileIsConnected).map(profileIdOf));
+  else state.campaignProfileIds = new Set(state.profiles.map(profileIdOf));
+  renderCampaignProfilePicker();
+}
+
+function setCampaignRecipeTab(tab) {
+  $$('[data-campaign-recipe-tab]').forEach(button => button.classList.toggle('active', button.dataset.campaignRecipeTab === tab));
+  $$('[data-campaign-recipe-panel]').forEach(panel => { panel.hidden = panel.dataset.campaignRecipePanel !== tab; });
+  if (tab === 'progress') renderCampaignProgressPreview();
+}
+
+function campaignNumber(selector, fallback = 0) {
+  const value = Number($(selector)?.value);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function campaignTextVariations() {
+  return String($('#campaign-text-variations')?.value || '')
+    .split(/\r?\n/)
+    .map(value => value.trim())
+    .filter(Boolean);
+}
+
+function updateCampaignRangeOutput(input) {
+  const output = $(`#${input.dataset.rangeOutput}`);
+  if (!output) return;
+  const suffix = input.id.includes('opacity') || input.id.includes('text-y') || input.id.includes('color-strength') ? '%' : ' px';
+  output.textContent = `${input.value}${suffix}`;
+}
+
+function syncCampaignProcessingConcurrency(source) {
+  const primary = $('#campaign-processing-concurrency');
+  const copy = $('#campaign-processing-concurrency-copy');
+  if (!primary || !copy) return;
+  if (source === 'copy') primary.value = copy.value;
+  else copy.value = primary.value;
+}
+
+function updateCampaignRecipeSummary() {
+  const target = $('#campaign-recipe-summary');
+  if (!target) return;
+  const recipe = campaignRecipePayload();
+  const labels = [];
+  if (recipe.overlayPath) labels.push(`оверлей · ${recipe.overlayPosition}`);
+  if (recipe.textVariations.length) labels.push(`текст · ${recipe.textVariations.length} вариаций`);
+  labels.push(`${recipe.layout === 'keep' ? 'исходный формат' : recipe.layout}`);
+  labels.push(`${recipe.fps === 'keep' ? 'исходный FPS' : `${recipe.fps} FPS`}`);
+  labels.push(`${recipe.bitrateKbps} Кбит/с`);
+  if (recipe.colorCorrectionEnabled) labels.push(`цветокор · ${recipe.colorStrength}%`);
+  if (recipe.audioMode === 'mute') labels.push('без звука');
+  else if (recipe.audioPath) labels.push('фоновая дорожка');
+  else if (recipe.audioMode === 'normalize') labels.push('громкость нормализуется');
+  target.innerHTML = labels.map(label => `<span>${escapeHtml(label)}</span>`).join('');
+}
+
+function renderCampaignProgressPreview() {
+  const target = $('#campaign-progress-preview');
+  if (!target) return;
+  if (state.campaignApiAvailable === false) {
+    target.innerHTML = '<b>Состояние кампаний пока недоступно</b><p>Обновите страницу после запуска локального сервера.</p>';
+    return;
+  }
+  const campaign = state.campaigns[0];
+  if (!campaign) {
+    target.innerHTML = '<b>Кампаний пока нет</b><p>Создайте кампанию — здесь появится её фактический статус.</p>';
+    return;
+  }
+  const summary = campaignSummary(campaign);
+  const total = summary.total || Number(campaign.outputCount || 0);
+  const accounted = summary.completed + summary.prepared + summary.awaiting + summary.uploading;
+  const percent = total ? Math.min(100, Math.round((accounted / total) * 100)) : 0;
+  const name = campaign.name || `Кампания ${String(campaign.id || '').slice(0, 8)}`;
+  target.innerHTML = `<b>${escapeHtml(name)}</b><p>${escapeHtml(taskStatusLabel(campaign.status || 'queued'))}: ${formatNumber(accounted)} из ${formatNumber(total)} результатов на следующем этапе.</p><div class="progress"><i style="width:${percent}%"></i></div>`;
+}
+
+function updateCampaignDistributionControls() {
+  const enabled = Boolean($('#campaign-enable-distribution')?.checked);
+  const controls = $('#campaign-distribution-fields');
+  const label = $('#campaign-auto-start-label');
+  if (controls) controls.disabled = !enabled;
+  if (label) label.textContent = enabled
+    ? 'Запустить обработку и распределение сразу после создания кампании'
+    : 'Запустить обработку сразу после создания кампании';
+  updateCampaignPlan();
+}
+
+function campaignSummary(campaign) {
+  const jobs = campaign.jobs || campaign.items || campaign.assignments || campaign.outputs || campaign.distribution || [];
+  const total = Number(campaign.total ?? campaign.outputCount ?? campaign.requestedOutputs ?? jobs.length ?? 0);
+  const pick = (...keys) => keys.reduce((result, key) => result + Number(campaign[key] || 0), 0);
+  const byStatus = status => jobs.filter(item => String(item.status || '').toLowerCase() === status).length;
+  return {
+    total,
+    processing: Number(campaign.processing ?? campaign.running ?? pick('processingCount') ?? 0) || byStatus('processing'),
+    prepared: Number(campaign.prepared ?? campaign.completedProcessing ?? 0) || byStatus('prepared'),
+    uploading: Number(campaign.uploading ?? 0) || byStatus('uploading'),
+    awaiting: Number(campaign.awaitingReview ?? campaign.awaiting ?? 0) || byStatus('awaiting-review'),
+    completed: Number(campaign.completed ?? 0) || byStatus('completed'),
+    errors: Number(campaign.failed ?? campaign.errors ?? 0) || byStatus('error'),
+    jobs,
+  };
+}
+
+function campaignItemLabel(item) {
+  return item.title || item.outputName || item.outputPath || item.fileName || item.sourceName || campaignNameFromPath(item.sourcePath || item.inputPath || 'ролик');
+}
+
+function campaignProfileLabel(item) {
+  const profile = state.profiles.find(candidate => profileIdOf(candidate) === String(item.profileId || item.targetProfileId || ''));
+  return profile ? profileNameOf(profile) : (item.profileName || item.profileId || item.targetProfileId || 'только обработка');
+}
+
+function renderCampaigns(loadError = null) {
+  const target = $('#campaign-results');
+  if (!target) return;
+  if (state.campaignApiAvailable === false) {
+    target.innerHTML = `<div class="empty">Экран кампаний готов. Серверная очередь кампаний подключается сейчас${loadError?.message ? `: ${escapeHtml(loadError.message)}` : '.'}</div>`;
+    renderCampaignProgressPreview();
+    return;
+  }
+  if (!state.campaigns.length) {
+    target.innerHTML = '<div class="empty">Кампаний пока нет. Добавьте исходники, настройте обработку и распределение, затем создайте первую кампанию.</div>';
+    renderCampaignProgressPreview();
+    return;
+  }
+  target.innerHTML = state.campaigns.slice(0, 12).map(campaign => {
+    const summary = campaignSummary(campaign);
+    const id = campaign.id || campaign.campaignId || '';
+    const sourceCount = (campaign.sourcePaths || campaign.sources || []).length || campaign.sourceCount || '—';
+    const selectedProfiles = (campaign.profileIds || campaign.profiles || []).length || campaign.profileCount || (campaign.distributionEnabled ? '—' : 'не выбраны');
+    const status = campaign.status || (summary.completed >= summary.total && summary.total ? 'completed' : summary.processing || summary.uploading ? 'running' : 'queued');
+    const canRun = ['queued', 'draft', 'paused', 'error', 'recovery-needed'].includes(status);
+    const progress = summary.total ? Math.min(100, Math.round(((summary.completed + summary.awaiting + summary.uploading + summary.prepared) / summary.total) * 100)) : 0;
+    const entries = summary.jobs.slice(0, 14).map(item => {
+      const itemStatus = item.status || item.stage || 'queued';
+      const details = item.message || item.error || item.sourceName || item.sourcePath || '';
+      const recipeChanges = Array.isArray(item.recipe?.materialChanges) ? item.recipe.materialChanges.join(', ') : '';
+      const duplicate = Number(item.duplicateRenderGroupSize || 1) > 1
+        ? `<span class="meta-tag">совпадающий рецепт: ${escapeHtml(item.duplicateRenderGroupSize)}</span>`
+        : '';
+      return `<div class="campaign-progress-row"><div><b>${escapeHtml(campaignItemLabel(item))}</b><small>${escapeHtml(details)}${recipeChanges ? ` · ${escapeHtml(recipeChanges)}` : ''}</small></div><div><span class="meta-tag accent">${escapeHtml(campaignProfileLabel(item))}</span>${duplicate}</div><div class="right">${statusPill(itemStatus, taskStatusLabel(itemStatus))}</div></div>`;
+    }).join('') || '<div class="empty">Сервер подготовит здесь распределение роликов по профилям после создания кампании.</div>';
+    const duplicateGroups = Array.isArray(campaign.duplicateRenderGroups) ? campaign.duplicateRenderGroups : [];
+    const duplicateNotice = duplicateGroups.length
+      ? `<div class="notice warn" style="margin-top:12px">В этой кампании есть совпадающие рецепты для ${duplicateGroups.reduce((total, group) => total + (group.outputIndexes?.length || 0), 0)} результатов. Они показаны в строках ниже; такие файлы не следует считать разными версиями только из-за повторного экспорта.</div>`
+      : '';
+    const uploadSummary = campaign.distributionEnabled
+      ? `<span><b>${summary.prepared}</b> в плане загрузки</span><span><b>${summary.awaiting}</b> на проверке</span>`
+      : '<span><b>—</b> распределение не включено</span>';
+    return `<article class="card campaign-batch"><div class="card-head"><div><h2>${escapeHtml(campaign.name || `Кампания ${String(id).slice(0, 8) || 'без названия'}`)}</h2><p class="hint">${formatDate(campaign.createdAt)} · ${sourceCount} источников · ${selectedProfiles} профилей · ${escapeHtml(campaign.outputCount || campaign.requestedOutputs || summary.total || '—')} результатов</p></div><div class="actions">${statusPill(status, taskStatusLabel(status))}${canRun && id ? `<button class="btn primary" data-campaign-run="${escapeHtml(id)}">Запустить</button>` : ''}</div></div><div class="campaign-summary"><span><b>${summary.completed}</b> выполнено</span><span><b>${summary.processing}</b> обработка</span>${uploadSummary}${summary.errors ? `<span><b>${summary.errors}</b> ошибок</span>` : ''}</div><div class="progress"><i style="width:${progress}%"></i></div>${duplicateNotice}<div class="list" style="margin-top:12px">${entries}</div></article>`;
+  }).join('');
+  target.querySelectorAll('[data-campaign-run]').forEach(button => button.onclick = () => runCampaign(button.dataset.campaignRun, button));
+  renderCampaignProgressPreview();
+}
+
+function campaignRecipePayload() {
+  return {
+    layout: $('#campaign-layout').value,
+    crop: $('#campaign-crop').value,
+    speedMin: Number($('#campaign-speed-min').value),
+    speedMax: Number($('#campaign-speed-max').value),
+    overlayPath: $('#campaign-overlay').value.trim(),
+    overlayOpacity: campaignNumber('#campaign-overlay-opacity', 100) / 100,
+    overlayPosition: $('#campaign-overlay-position').value,
+    overlayWidth: campaignNumber('#campaign-overlay-width', 240),
+    overlayBlurMin: campaignNumber('#campaign-overlay-blur-min', 0),
+    overlayBlurMax: campaignNumber('#campaign-overlay-blur-max', 0),
+    textVariations: campaignTextVariations(),
+    fontPath: $('#campaign-font-path').value.trim(),
+    textSize: campaignNumber('#campaign-text-size', 70),
+    textY: campaignNumber('#campaign-text-y', 65),
+    textColorMode: $('#campaign-text-color-mode').value,
+    textOutline: $('#campaign-text-outline').checked,
+    fps: $('#campaign-fps').value === 'keep' ? 'keep' : campaignNumber('#campaign-fps', 30),
+    bitrateKbps: campaignNumber('#campaign-bitrate-kbps', 8000),
+    colorCorrectionEnabled: $('#campaign-color-correction-enabled').checked,
+    colorStrength: campaignNumber('#campaign-color-strength', 35),
+    audioMode: $('#campaign-audio-mode').value,
+    audioPath: $('#campaign-audio-path').value.trim(),
+    metadataMode: $('#campaign-metadata').value,
+    addToLibrary: $('#campaign-add-to-library').checked,
+  };
+}
+
+async function createCampaign(event) {
+  event.preventDefault();
+  const sourcePaths = [...$('#campaign-inputs').selectedOptions].map(option => option.value).filter(Boolean);
+  const outputCount = Math.floor(Number($('#campaign-output-count').value));
+  const message = '#campaign-message';
+  if (!sourcePaths.length) return setMessage(message, 'Выберите хотя бы один исходный ролик из библиотеки.', 'error');
+  if (!Number.isInteger(outputCount) || outputCount < 1) return setMessage(message, 'Укажите положительное количество готовых роликов.', 'error');
+  const distributionEnabled = $('#campaign-enable-distribution').checked;
+  if (distributionEnabled && !state.campaignProfileIds.size) return setMessage(message, 'Для распределения выберите хотя бы один профиль Dolphin.', 'error');
+  const speedMin = Number($('#campaign-speed-min').value);
+  const speedMax = Number($('#campaign-speed-max').value);
+  if (!Number.isFinite(speedMin) || !Number.isFinite(speedMax) || speedMin > speedMax) return setMessage(message, 'Минимальная скорость не может быть больше максимальной.', 'error');
+  const overlayBlurMin = campaignNumber('#campaign-overlay-blur-min', 0);
+  const overlayBlurMax = campaignNumber('#campaign-overlay-blur-max', 0);
+  if (overlayBlurMin > overlayBlurMax) return setMessage(message, 'Минимальное размытие оверлея не может быть больше максимального.', 'error');
+  const bitrateKbps = campaignNumber('#campaign-bitrate-kbps', 0);
+  if (!Number.isInteger(bitrateKbps) || bitrateKbps < 500 || bitrateKbps > 50000) return setMessage(message, 'Укажите битрейт от 500 до 50 000 Кбит/с.', 'error');
+  const schedule = $('#campaign-schedule').value;
+  const body = {
+    sourcePaths,
+    outputCount,
+    outputFolder: $('#campaign-output-folder').value.trim(),
+    outputTemplate: $('#campaign-output-template').value.trim(),
+    recipe: campaignRecipePayload(),
+    profileIds: distributionEnabled ? [...state.campaignProfileIds] : [],
+    distributionEnabled,
+    titleTemplate: $('#campaign-title-template').value.trim(),
+    descriptionTemplate: $('#campaign-description-template').value.trim(),
+    tags: $('#campaign-tags').value.split(',').map(tag => tag.trim()).filter(Boolean),
+    autoStart: $('#campaign-auto-start').checked,
+    processingConcurrency: Number($('#campaign-processing-concurrency').value),
+    uploadConcurrency: Number($('#campaign-upload-concurrency').value),
+    scheduledAt: schedule ? new Date(schedule).toISOString() : null,
+  };
+  if (!body.outputFolder || !body.outputTemplate || (distributionEnabled && !body.titleTemplate)) {
+    return setMessage(message, distributionEnabled ? 'Укажите папку, шаблон имени и шаблон заголовка.' : 'Укажите папку и шаблон имени.', 'error');
+  }
+  const button = $('#campaign-submit');
+  button.disabled = true;
+  button.textContent = 'Создаём кампанию…';
+  try {
+    const result = await api('/api/campaigns', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const campaign = result.campaign || result;
+    setMessage(message, body.autoStart
+      ? `Кампания создана: ${campaign.outputCount || outputCount} результатов поставлены в конвейер${distributionEnabled ? ' с распределением по профилям.' : '.'}`
+      : `Кампания создана: ${campaign.outputCount || outputCount} результатов ожидают запуска.`);
+    $('#campaign-form').reset();
+    $('#campaign-output-count').value = '10';
+    $('#campaign-processing-concurrency').value = '1';
+    syncCampaignProcessingConcurrency();
+    $('#campaign-upload-concurrency').value = '5';
+    $('#campaign-add-to-library').checked = true;
+    $('#campaign-auto-start').checked = true;
+    $('#campaign-enable-distribution').checked = false;
+    state.campaignProfileIds = new Set();
+    renderCampaignSourcePicker();
+    renderCampaignProfilePicker();
+    updateCampaignDistributionControls();
+    await Promise.all([loadCampaigns(), loadLogs(), loadWorkerSettings()]);
+  } catch (error) {
+    setMessage(message, error.message, 'error');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Создать кампанию';
+  }
+}
+
+async function runCampaign(id, button) {
+  const text = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Запуск…';
+  try {
+    await api(`/api/campaigns/${encodeURIComponent(id)}/run`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    await Promise.all([loadCampaigns(), loadLogs(), loadWorkerSettings()]);
+  } catch (error) {
+    button.textContent = error.message;
+    setTimeout(() => { button.textContent = text; button.disabled = false; }, 2500);
+  }
+}
+
 async function loadHealth() {
   state.health = await api('/api/health');
   const online = state.health.remoteApi && state.health.localReachable;
@@ -191,9 +540,10 @@ async function loadProfiles() {
   const availableIds = new Set(state.profiles.map(profileIdOf));
   state.bulkProfileIds = new Set([...state.bulkProfileIds].filter(id => availableIds.has(id)));
   state.channelBulkProfileIds = new Set([...state.channelBulkProfileIds].filter(id => availableIds.has(id)));
+  state.campaignProfileIds = new Set([...state.campaignProfileIds].filter(id => availableIds.has(id)));
   ['#task-profile', '#channel-profile', '#analytics-profile'].forEach(selector => fillProfileSelect($(selector)));
   $('#metric-profiles').textContent = formatNumber(state.profiles.length);
-  renderProfiles(); renderAccounts(); renderBulkProfilePicker(); renderChannelBulkProfilePicker(); renderWorkspaceStatus();
+  renderProfiles(); renderAccounts(); renderBulkProfilePicker(); renderChannelBulkProfilePicker(); renderCampaignProfilePicker(); renderWorkspaceStatus();
 }
 
 async function loadAccounts() {
@@ -202,6 +552,7 @@ async function loadAccounts() {
   renderProfiles();
   renderAccounts();
   renderBulkProfilePicker();
+  renderCampaignProfilePicker();
   renderWorkspaceStatus();
 }
 
@@ -233,6 +584,7 @@ async function loadLibrary() {
   state.library = response.library || [];
   fillLibrarySelect($('#task-library')); fillLibrarySelect($('#render-source'), false);
   renderProcessingInputPicker();
+  renderCampaignSourcePicker();
   $('#metric-library').textContent = formatNumber(state.library.length);
   renderLibrary(); renderWorkspaceStatus();
 }
@@ -248,6 +600,20 @@ async function loadProcessingBatches() {
   state.processingBatches = response.batches || [];
   state.processingProcessor = response.processor || null;
   renderProcessingBatches();
+}
+
+async function loadCampaigns() {
+  const target = $('#campaign-results');
+  if (!target) return;
+  try {
+    const response = await api('/api/campaigns');
+    state.campaigns = Array.isArray(response) ? response : (response.campaigns || response.items || []);
+    state.campaignApiAvailable = true;
+    renderCampaigns();
+  } catch (error) {
+    state.campaignApiAvailable = false;
+    renderCampaigns(error);
+  }
 }
 
 async function loadLogs() {
@@ -297,7 +663,7 @@ async function refreshAll() {
   $('#refresh-all').disabled = true;
   try {
     await loadHealth();
-    await Promise.all([loadProfiles(), loadAccounts(), loadTasks(), loadLibrary(), loadChannelTasks(), loadProcessingBatches(), loadLogs(), loadProxies(), loadFfmpeg(), loadWorkerSettings(), loadStudioBatches(), loadAccountBatches(), loadFolders()]);
+    await Promise.all([loadProfiles(), loadAccounts(), loadTasks(), loadLibrary(), loadChannelTasks(), loadProcessingBatches(), loadCampaigns(), loadLogs(), loadProxies(), loadFfmpeg(), loadWorkerSettings(), loadStudioBatches(), loadAccountBatches(), loadFolders()]);
     await refreshAnalyticsView();
   } catch (error) {
     const notice = $('#connection-notice'); notice.className = 'notice error'; notice.textContent = error.message;
@@ -309,7 +675,7 @@ async function refreshLiveState() {
   if (liveRefreshRunning) return;
   liveRefreshRunning = true;
   try {
-    await Promise.all([loadTasks(), loadLogs(), loadWorkerSettings(), loadStudioBatches(), loadAccounts(), loadAccountBatches(), loadProcessingBatches(), loadLibrary()]);
+    await Promise.all([loadTasks(), loadLogs(), loadWorkerSettings(), loadStudioBatches(), loadAccounts(), loadAccountBatches(), loadProcessingBatches(), loadCampaigns(), loadLibrary()]);
     if ($('#analytics').classList.contains('active')) await refreshAnalyticsView();
   } catch {
     // The main refresh action keeps connection errors visible; background refresh stays quiet.
@@ -881,6 +1247,37 @@ function bindEvents() {
   $('#bulk-select-none').onclick = () => setAllBulkProfiles(false);
   $('#library-upload').onclick = uploadLibraryFiles;
   $('#library-import-path').onclick = importLibraryPath;
+  $('#campaign-form').onsubmit = createCampaign;
+  $('#campaign-refresh').onclick = () => Promise.all([loadCampaigns(), loadLibrary(), loadProfiles(), loadAccounts()]);
+  $('#campaign-output-count').oninput = updateCampaignPlan;
+  $('#campaign-enable-distribution').onchange = updateCampaignDistributionControls;
+  $('#campaign-select-connected').onclick = () => setCampaignProfiles('connected');
+  $('#campaign-select-all').onclick = () => setCampaignProfiles('all');
+  $('#campaign-select-none').onclick = () => setCampaignProfiles('none');
+  $$('[data-campaign-recipe-tab]').forEach(button => button.onclick = () => setCampaignRecipeTab(button.dataset.campaignRecipeTab));
+  $$('[data-range-output]').forEach(input => {
+    updateCampaignRangeOutput(input);
+    input.addEventListener('input', () => {
+      updateCampaignRangeOutput(input);
+      updateCampaignRecipeSummary();
+    });
+  });
+  const recipeControls = [
+    '#campaign-overlay', '#campaign-overlay-position', '#campaign-overlay-width', '#campaign-text-variations', '#campaign-font-path',
+    '#campaign-text-size', '#campaign-text-color-mode', '#campaign-text-outline', '#campaign-layout', '#campaign-crop',
+    '#campaign-speed-min', '#campaign-speed-max', '#campaign-fps', '#campaign-bitrate-kbps', '#campaign-color-correction-enabled',
+    '#campaign-audio-mode', '#campaign-audio-path', '#campaign-metadata', '#campaign-add-to-library',
+  ];
+  recipeControls.forEach(selector => {
+    const control = $(selector);
+    if (!control) return;
+    control.addEventListener('input', updateCampaignRecipeSummary);
+    control.addEventListener('change', updateCampaignRecipeSummary);
+  });
+  $('#campaign-processing-concurrency').onchange = () => syncCampaignProcessingConcurrency();
+  $('#campaign-processing-concurrency-copy').onchange = () => syncCampaignProcessingConcurrency('copy');
+  syncCampaignProcessingConcurrency();
+  updateCampaignRecipeSummary();
   $('#channel-read').onclick = () => readChannel(false);
   $('#channel-form').onsubmit = createChannelTask;
   $('#channel-bulk-form').onsubmit = createBulkChannelTasks;

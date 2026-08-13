@@ -61,6 +61,111 @@ assert.ok(args.includes(path.join(fixtures, 'bed.mp3')));
 assert.equal(args.includes('-metadata'), false, 'recipe must not invent container metadata');
 assert.equal(args.at(-1), path.join(fixtures, 'output-a.mp4'));
 
+const explicitVisualEdits = {
+  ...editorialEdits,
+  overlay: {
+    ...editorialEdits.overlay,
+    blur: { min: 0.2, max: 0.65 },
+  },
+  text: {
+    value: "We're: ready, [cut]; \\again",
+    fontFile: path.join(fixtures, 'headline.ttf'),
+    size: 72,
+    position: 'top-center',
+    color: '#F5A623',
+    outline: { color: '#112233', width: 4 },
+    margin: 40,
+    yPercent: 37.5,
+  },
+  color: { level: 'medium', amount: 65 },
+  video: { fps: 30, quality: 'high' },
+};
+const visualRecipe = createEditorialRecipe({
+  source,
+  campaignId: 'visible-editorial-edits',
+  variantIndex: 3,
+  profileId: 'captioned',
+  edits: explicitVisualEdits,
+});
+assert.ok(visualRecipe.edits.overlay.blur >= 0.2 && visualRecipe.edits.overlay.blur <= 0.65);
+assert.deepEqual(visualRecipe.edits.overlay.blurBounds, { min: 0.2, max: 0.65 });
+assert.deepEqual(visualRecipe.edits.text.outline, { color: '#112233', width: 4 });
+assert.equal(visualRecipe.edits.text.yPercent, 37.5);
+assert.deepEqual(visualRecipe.edits.color, { level: 'medium', amount: 65 });
+assert.deepEqual(visualRecipe.edits.video, { fps: 30, quality: 'high' });
+assert.ok(visualRecipe.materialChanges.includes('color-medium-65pct'));
+assert.ok(visualRecipe.materialChanges.includes('fps-30'));
+assert.ok(visualRecipe.materialChanges.includes('quality-high'));
+assert.ok(visualRecipe.materialChanges.some(change => change.startsWith('overlay-blur-')));
+assert.ok(visualRecipe.materialChanges.includes('text-top-center-72px'));
+
+const visualArgs = buildFfmpegArgs(visualRecipe, { outputPath: path.join(fixtures, 'output-visual.mp4') });
+const visualFilters = visualArgs[visualArgs.indexOf('-filter_complex') + 1];
+assert.ok(visualFilters.includes('boxblur=luma_radius='), 'the resolved overlay blur must be rendered visibly');
+assert.ok(visualFilters.includes('eq=contrast=1.0455:brightness=0.0065:saturation=1.0585:gamma=1.0195'));
+assert.ok(visualFilters.includes('fps=fps=30'));
+assert.ok(visualFilters.includes("text='We\\'re\\: ready\\, \\[cut\\]\\; \\\\again'"), 'drawtext content must be escaped for FFmpeg without a shell');
+assert.ok(visualFilters.includes("fontfile='"), 'drawtext must receive the required font file');
+assert.ok(visualFilters.includes(':expansion=none:'), 'drawtext text must stay literal and reproducible');
+assert.ok(visualFilters.includes(':x=(w-text_w)/2:y='), 'text X coordinate must be emitted as a complete expression');
+assert.ok(visualFilters.includes(':y=h*0.375-text_h/2'), 'text Y percent must map to the visible exact vertical position');
+assert.ok(visualFilters.includes('borderw=4:bordercolor=0x112233'));
+assert.equal(visualArgs.includes('-r'), false, 'target FPS stays in the explicit filter graph');
+assert.equal(visualArgs.includes('-b:v'), false, 'quality mode must use CRF rather than a conflicting bitrate');
+assert.equal(visualArgs[visualArgs.indexOf('-crf') + 1], '18');
+
+const bitrateRecipe = createEditorialRecipe({
+  source,
+  campaignId: 'bitrate-editorial',
+  edits: { video: { bitrateKbps: 4_500 } },
+});
+const bitrateArgs = buildFfmpegArgs(bitrateRecipe, { outputPath: path.join(fixtures, 'output-bitrate.mp4') });
+assert.equal(bitrateArgs[bitrateArgs.indexOf('-b:v') + 1], '4500k');
+assert.equal(bitrateArgs[bitrateArgs.indexOf('-maxrate') + 1], '4500k');
+assert.equal(bitrateArgs.includes('-crf'), false, 'bitrate mode must not add a competing CRF target');
+
+assert.throws(
+  () => createEditorialRecipe({ source, edits: { text: { value: 'Caption', size: 52 } } }),
+  /fontFile/,
+  'visible text must require a real font file path',
+);
+assert.throws(
+  () => createEditorialRecipe({ source, edits: { color: 'vivid' } }),
+  /edits\.color/,
+  'color correction must remain within its declared levels',
+);
+assert.throws(
+  () => createEditorialRecipe({ source, edits: { video: { bitrateKbps: 4_500, quality: 'high' } } }),
+  /bitrateKbps or edits\.video\.quality/,
+  'bitrate and CRF quality targets must not conflict',
+);
+
+const blurredPlan = createEditorialCampaignPlan({
+  sources: [source],
+  outputCount: 5,
+  campaignId: 'bounded-blur-spread',
+  profiles: [{
+    id: 'visible-overlay',
+    edits: { overlay: { filePath: path.join(fixtures, 'title.png'), width: 240, blur: { min: 0.1, max: 0.9 } } },
+  }],
+});
+const plannedBlurValues = blurredPlan.recipes.map(recipe => recipe.edits.overlay.blur);
+assert.ok(plannedBlurValues.every(value => value >= 0.1 && value <= 0.9));
+assert.ok(new Set(plannedBlurValues).size > 1, 'output-index seeds should resolve a declared blur range into visible, bounded variation');
+assert.deepEqual(
+  createEditorialCampaignPlan({
+    sources: [source],
+    outputCount: 5,
+    campaignId: 'bounded-blur-spread',
+    profiles: [{
+      id: 'visible-overlay',
+      edits: { overlay: { filePath: path.join(fixtures, 'title.png'), width: 240, blur: { min: 0.1, max: 0.9 } } },
+    }],
+  }).recipes.map(recipe => recipe.edits.overlay.blur),
+  plannedBlurValues,
+  'the resolved value is reproducible for the same campaign identity',
+);
+
 assert.throws(
   () => createEditorialRecipe({ source, edits: { pace: 1.2 } }),
   /edits\.pace/,

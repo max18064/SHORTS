@@ -10,6 +10,12 @@ import { openUploadSession, uploadIntoSession, uploadOwnVideo } from './upload-w
 import { inspectChannel, updateChannelBranding } from './channel-worker.js';
 import { readStudioVideos } from './studio-reader.js';
 import { inspectMediaFile } from './media-inspector.js';
+import {
+  MAX_EDITORIAL_CAMPAIGN_OUTPUTS,
+  buildFfmpegArgs,
+  createEditorialRecipe,
+  validateEditorialRecipe,
+} from './variant-recipes.js';
 
 const app = express();
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -28,6 +34,10 @@ const library = [];
 // It contains only explicit local input/output pairs for media the operator
 // has already placed in the Creator Flow library.
 const processingBatches = [];
+// A media campaign joins an explicit, local processing batch to a
+// deterministic, review-only upload plan.  It never contains credentials and
+// it never starts a Dolphin/YouTube operation merely by being created.
+const mediaCampaigns = [];
 const studioCache = {};
 const studioSyncBatches = [];
 // Account status is intentionally a small, read-only cache.  It never keeps
@@ -77,6 +87,7 @@ if (fs.existsSync(statePath)) {
     channelTasks.push(...(saved.channelTasks || []));
     library.push(...(saved.library || []));
     processingBatches.push(...(Array.isArray(saved.processingBatches) ? saved.processingBatches.filter(isObjectRecord) : []));
+    mediaCampaigns.push(...(Array.isArray(saved.mediaCampaigns) ? saved.mediaCampaigns.filter(isObjectRecord) : []));
     Object.assign(studioCache, saved.studioCache || {});
     studioSyncBatches.push(...(saved.studioSyncBatches || []));
     const persistedAccounts = isObjectRecord(saved.accountStatusCache) ? saved.accountStatusCache : {};
@@ -146,6 +157,31 @@ for (const batch of processingBatches) {
   refreshProcessingBatchStatus(batch);
   if (batch.status !== previousStatus) stateNeedsCleanup = true;
 }
+for (const campaign of mediaCampaigns) {
+  if (!Array.isArray(campaign.assignments)) {
+    campaign.assignments = [];
+    stateNeedsCleanup = true;
+  } else {
+    const validAssignments = campaign.assignments.filter(isObjectRecord);
+    if (validAssignments.length !== campaign.assignments.length) {
+      campaign.assignments = validAssignments;
+      stateNeedsCleanup = true;
+    }
+  }
+  for (const assignment of campaign.assignments) {
+    const batch = processingBatches.find(item => item.id === assignment.processingBatchId);
+    const item = batch?.items?.find(candidate => candidate.id === assignment.processingItemId);
+    if (item?.status === 'recovery-needed' && ['running', 'processing'].includes(assignment.status)) {
+      assignment.status = 'recovery-needed';
+      assignment.message = 'Локальная обработка была прервана перезапуском. Проверьте выходной файл и перезапустите только эту кампанию при необходимости.';
+      assignment.updatedAt = new Date().toISOString();
+      stateNeedsCleanup = true;
+    }
+  }
+  const previousStatus = campaign.status;
+  refreshMediaCampaignStatus(campaign);
+  if (campaign.status !== previousStatus) stateNeedsCleanup = true;
+}
 for (const batch of studioSyncBatches) {
   for (const item of batch.items || []) {
     if (item.status === 'running') {
@@ -183,7 +219,7 @@ function saveState() {
   if (stateLoadError) {
     throw new Error('Локальное состояние не прочитано; исходный файл сохранён как резервная копия. Восстановите его перед изменением данных.');
   }
-  const payload = JSON.stringify({ tasks, proxies, videos, channelTasks, library, processingBatches, studioCache, studioSyncBatches, accountStatusCache, accountCheckBatches, automationSessions, settings }, null, 2);
+  const payload = JSON.stringify({ tasks, proxies, videos, channelTasks, library, processingBatches, mediaCampaigns, studioCache, studioSyncBatches, accountStatusCache, accountCheckBatches, automationSessions, settings }, null, 2);
   const tempPath = `${statePath}.${process.pid}.${Date.now()}.tmp`;
   try {
     fs.writeFileSync(tempPath, payload);
@@ -628,7 +664,9 @@ async function streamLibraryUpload(request, tempPath) {
 // network/profile worker pool. FFmpeg is CPU and disk intensive, so a batch
 // defaults to one encoder and can use at most three concurrent encoders.
 const MAX_PROCESSING_BATCH_SIZE = 50;
-const MAX_PROCESSING_BATCHES = 20;
+// Campaigns are split into chunks of 50 jobs, but a campaign itself can be
+// larger. Keep enough persisted batch history for several 500-output runs.
+const MAX_PROCESSING_BATCHES = 120;
 const MAX_PROCESSING_CONCURRENCY = 3;
 const processingOutputExtensions = new Set(['.mp4']);
 
@@ -772,13 +810,18 @@ async function renderProcessingJob(item) {
   const temporaryPath = processingTempPath(item);
   if (fs.existsSync(item.outputPath)) throw processingError('Выходной файл уже существует. Для повторной обработки укажите новый путь.', 409, 'processing-output-exists');
   if (fs.existsSync(temporaryPath)) await fs.promises.rm(temporaryPath, { force: true });
-  const args = ['-hide_banner', '-nostdin', '-n', '-i', item.inputPath];
-  if (item.overlayPath) {
-    args.push('-i', item.overlayPath, '-filter_complex', '[0:v][1:v]overlay=0:0:format=auto[v]', '-map', '[v]', '-map', '0:a?');
-  } else {
-    args.push('-map', '0:v:0', '-map', '0:a?');
-  }
-  args.push('-map_metadata', '-1', '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-c:a', 'aac', '-movflags', '+faststart', temporaryPath);
+  const args = item.recipe
+    ? buildFfmpegArgs(validateEditorialRecipe(item.recipe), { outputPath: temporaryPath, overwrite: false })
+    : (() => {
+      const legacyArgs = ['-hide_banner', '-nostdin', '-n', '-i', item.inputPath];
+      if (item.overlayPath) {
+        legacyArgs.push('-i', item.overlayPath, '-filter_complex', '[0:v][1:v]overlay=0:0:format=auto[v]', '-map', '[v]', '-map', '0:a?');
+      } else {
+        legacyArgs.push('-map', '0:v:0', '-map', '0:a?');
+      }
+      legacyArgs.push('-map_metadata', '-1', '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-c:a', 'aac', '-movflags', '+faststart', temporaryPath);
+      return legacyArgs;
+    })();
   try {
     await execFileAsync(ffmpegBin, args, { windowsHide: true, maxBuffer: 2 * 1024 * 1024 });
     const metadata = await inspectMediaFile(temporaryPath, { ffprobeBin });
@@ -798,6 +841,7 @@ async function runProcessingBatchItem(batch, item) {
   item.updatedAt = new Date().toISOString();
   refreshProcessingBatchStatus(batch);
   saveState();
+  syncMediaCampaignProgress();
   try {
     if (!libraryOwnsProcessingInput(item.inputPath)) {
       throw processingError('Исходник больше не находится в библиотеке Creator Flow.');
@@ -810,11 +854,17 @@ async function runProcessingBatchItem(batch, item) {
       try { return path.resolve(entry.filePath) === path.resolve(metadata.filePath); }
       catch { return false; }
     });
-    const libraryItem = existing || makeLibraryEntry(metadata, 'processed-batch');
-    if (!existing) library.unshift(libraryItem);
-    item.libraryItem = { id: libraryItem.id, fileName: libraryItem.fileName, filePath: libraryItem.filePath };
+    if (item.addToLibrary !== false) {
+      const libraryItem = existing || makeLibraryEntry(metadata, item.campaignId ? 'campaign-output' : 'processed-batch');
+      if (!existing) library.unshift(libraryItem);
+      item.libraryItem = { id: libraryItem.id, fileName: libraryItem.fileName, filePath: libraryItem.filePath };
+    } else {
+      delete item.libraryItem;
+    }
     item.status = 'completed';
-    item.message = 'Обработка завершена; отдельный выходной файл добавлен в библиотеку.';
+    item.message = item.addToLibrary === false
+      ? 'Обработка завершена; готовый файл сохранён в указанной папке.'
+      : 'Обработка завершена; отдельный выходной файл добавлен в библиотеку.';
     addLog(`Пакетная обработка завершена: ${metadata.fileName}`, null, 'info');
   } catch (error) {
     item.status = 'error';
@@ -825,6 +875,7 @@ async function runProcessingBatchItem(batch, item) {
   item.updatedAt = new Date().toISOString();
   refreshProcessingBatchStatus(batch);
   saveState();
+  syncMediaCampaignProgress();
   return item;
 }
 
@@ -852,7 +903,7 @@ async function processProcessingBatches() {
       if (!['queued', 'running'].includes(batch.status)) continue;
       if (batch.autoRun !== true) continue;
       const limit = Math.min(Math.max(Number(batch.concurrency) || 1, 1), MAX_PROCESSING_CONCURRENCY);
-      while (true) {
+      while (activeProcessingJobIds.size < MAX_PROCESSING_CONCURRENCY) {
         const batchActive = (batch.items || []).filter(item => activeProcessingJobIds.has(item.id)).length;
         if (batchActive >= limit) break;
         const item = (batch.items || []).find(candidate => (
@@ -890,6 +941,678 @@ function queueProcessingRetry(batch, item) {
   item.updatedAt = new Date().toISOString();
   refreshProcessingBatchStatus(batch);
   saveState();
+}
+
+// Campaigns are the higher-level uniqueizer workflow.  They keep the
+// requested source-to-output plan and split the actual FFmpeg work into
+// bounded processing batches.  The split is an implementation detail: the
+// operator sees one campaign with one coherent progress view.
+const MAX_MEDIA_CAMPAIGNS = 40;
+const MAX_CAMPAIGN_PROFILES = 20;
+const MAX_CAMPAIGN_TAGS = 50;
+
+function campaignError(message, statusCode = 400, code = 'campaign-invalid') {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.code = code;
+  return error;
+}
+
+function normalizeCampaignText(value, label, { required = false, maxLength = 5000 } = {}) {
+  if (value === undefined || value === null || value === '') {
+    if (required) throw campaignError(`${label} is required.`, 400, 'campaign-required');
+    return '';
+  }
+  if (typeof value !== 'string') throw campaignError(`${label} must be text.`, 400, 'campaign-invalid-text');
+  const result = value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ').trim();
+  if (!result && required) throw campaignError(`${label} is required.`, 400, 'campaign-required');
+  if (result.length > maxLength) throw campaignError(`${label} is too long.`, 400, 'campaign-text-too-long');
+  return result;
+}
+
+function normalizeCampaignOutputCount(value) {
+  const count = Number(value);
+  if (!Number.isInteger(count) || count < 1 || count > MAX_EDITORIAL_CAMPAIGN_OUTPUTS) {
+    throw campaignError(`Choose an integer output count from 1 to ${MAX_EDITORIAL_CAMPAIGN_OUTPUTS}.`, 422, 'campaign-output-count');
+  }
+  return count;
+}
+
+function campaignLibrarySource(rawPath, index) {
+  const filePath = normalizeProcessingPath(rawPath, `Campaign source ${index + 1}`);
+  const item = library.find(entry => {
+    try { return path.resolve(entry.filePath) === filePath; }
+    catch { return false; }
+  });
+  if (!item) throw campaignError(`Campaign source ${index + 1} must first be added to the local library.`, 422, 'campaign-source-not-library');
+  if (item.hasVideo === false) throw campaignError(`Campaign source ${index + 1} does not contain a video stream.`, 422, 'campaign-source-no-video');
+  try {
+    if (!fs.statSync(filePath).isFile()) throw new Error('not-a-file');
+  } catch {
+    throw campaignError(`Campaign source ${index + 1} is no longer available on disk.`, 422, 'campaign-source-missing');
+  }
+  return {
+    id: String(item.id || filePath),
+    filePath,
+    fileName: item.fileName || path.basename(filePath),
+    hasAudio: item.hasAudio === true,
+  };
+}
+
+function normalizeCampaignSources(body) {
+  const raw = Array.isArray(body?.sourcePaths) ? body.sourcePaths : body?.sourcePaths === undefined && Array.isArray(body?.sourceIds) ? body.sourceIds : null;
+  if (!Array.isArray(raw) || raw.length === 0) throw campaignError('Choose at least one source video from the local library.', 400, 'campaign-sources-required');
+  if (raw.length > MAX_EDITORIAL_CAMPAIGN_OUTPUTS) throw campaignError(`A campaign can use at most ${MAX_EDITORIAL_CAMPAIGN_OUTPUTS} sources.`, 422, 'campaign-too-many-sources');
+  const seen = new Set();
+  const sources = [];
+  raw.forEach((value, index) => {
+    let filePath;
+    if (typeof value === 'string') {
+      const byId = library.find(item => String(item.id) === value.trim());
+      filePath = byId?.filePath || value;
+    }
+    else if (typeof value === 'number') {
+      const found = library.find(item => String(item.id) === String(value));
+      filePath = found?.filePath || '';
+    } else if (isObjectRecord(value)) filePath = value.filePath || value.path || '';
+    else filePath = '';
+    const source = campaignLibrarySource(filePath, index);
+    if (!seen.has(source.filePath)) {
+      seen.add(source.filePath);
+      sources.push(source);
+    }
+  });
+  if (!sources.length) throw campaignError('Choose at least one valid source video.', 422, 'campaign-sources-required');
+  return sources;
+}
+
+function normalizeCampaignOutputFolder(value) {
+  const outputFolder = normalizeProcessingPath(value, 'Output folder');
+  try {
+    if (!fs.statSync(outputFolder).isDirectory()) throw new Error('not-a-directory');
+  } catch {
+    throw campaignError('The output folder does not exist or is not accessible.', 422, 'campaign-output-folder');
+  }
+  return outputFolder;
+}
+
+function normalizeCampaignOutputTemplate(value) {
+  const template = normalizeCampaignText(value, 'Output filename template', { required: true, maxLength: 255 });
+  if (template.includes('/') || template.includes('\\') || path.basename(template) !== template) {
+    throw campaignError('The output filename template must not include folders.', 422, 'campaign-output-template');
+  }
+  if (!template.toLowerCase().endsWith('.mp4')) {
+    throw campaignError('The output filename template must end in .mp4.', 422, 'campaign-output-template');
+  }
+  return template;
+}
+
+function campaignSourceName(source) {
+  return path.basename(source.fileName || source.filePath, path.extname(source.fileName || source.filePath)) || 'video';
+}
+
+function campaignOutputPath(outputFolder, template, source, outputIndex, campaignId) {
+  const rendered = template
+    .replaceAll('{source}', campaignSourceName(source))
+    .replaceAll('{index}', String(outputIndex))
+    .replaceAll('{campaign}', String(campaignId).slice(0, 8));
+  const fileName = safeFileName(rendered);
+  if (!fileName.toLowerCase().endsWith('.mp4')) throw campaignError('The output template produced an invalid .mp4 filename.', 422, 'campaign-output-template');
+  return path.join(outputFolder, fileName);
+}
+
+function processingOutputIsReserved(outputPath) {
+  let normalized;
+  try { normalized = path.resolve(outputPath); }
+  catch { return true; }
+  return processingBatches.some(batch => (batch.items || []).some(item => {
+    try { return path.resolve(item.outputPath) === normalized; }
+    catch { return false; }
+  }));
+}
+
+function normalizeCampaignProfileIds(rawIds, enabled) {
+  if (!enabled) return [];
+  const normalized = normalizeBulkProfileIds(rawIds);
+  if (normalized.error) throw campaignError(normalized.error, 400, 'campaign-profiles');
+  if (normalized.profileIds.length > MAX_CAMPAIGN_PROFILES) {
+    throw campaignError(`Choose no more than ${MAX_CAMPAIGN_PROFILES} profiles for one campaign.`, 422, 'campaign-too-many-profiles');
+  }
+  return normalized.profileIds;
+}
+
+const CAMPAIGN_TEXT_COLORS = Object.freeze([
+  '#FFFFFF', '#45C873', '#FFD166', '#79B8FF', '#F58FB7', '#C9A7FF', '#FF9D66',
+]);
+
+function campaignTextColor(mode, outputIndex) {
+  if (mode === 'white') return '#FFFFFF';
+  if (mode === 'accent') return '#45C873';
+  if (mode && mode !== 'random-visible') {
+    throw campaignError('Text color mode is not supported.', 422, 'campaign-text-color');
+  }
+  return CAMPAIGN_TEXT_COLORS[(outputIndex - 1) % CAMPAIGN_TEXT_COLORS.length];
+}
+
+function normalizeCampaignTextVariations(raw) {
+  if (raw === undefined || raw === null || raw === '') return [];
+  if (!Array.isArray(raw) || raw.some(value => typeof value !== 'string')) {
+    throw campaignError('Text variations must be a list of text lines.', 422, 'campaign-text-variations');
+  }
+  if (raw.length > 250) throw campaignError('Use no more than 250 text variations.', 422, 'campaign-text-variations');
+  const values = raw
+    .map(value => normalizeCampaignText(value, 'Text variation', { maxLength: 280 }))
+    .filter(Boolean);
+  if (values.length !== raw.length) {
+    throw campaignError('Text variations must not be empty.', 422, 'campaign-text-variations');
+  }
+  return values;
+}
+
+function defaultCampaignFontPath() {
+  const candidates = [
+    process.env.CREATOR_FLOW_DEFAULT_FONT,
+    process.platform === 'win32' ? path.join(process.env.WINDIR || 'C:\\Windows', 'Fonts', 'arial.ttf') : '',
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      const resolved = path.resolve(candidate);
+      if (fs.statSync(resolved).isFile() && ['.ttf', '.otf'].includes(path.extname(resolved).toLowerCase())) return resolved;
+    } catch { /* Try the next explicit local font candidate. */ }
+  }
+  return '';
+}
+
+function normalizeCampaignFontPath(raw) {
+  const requested = normalizeCampaignText(raw, 'Font path', { maxLength: 4_096 });
+  const fontPath = requested ? path.resolve(requested) : defaultCampaignFontPath();
+  if (!fontPath) {
+    throw campaignError('Choose a .ttf or .otf font file for visible text.', 422, 'campaign-font-required');
+  }
+  if (!['.ttf', '.otf'].includes(path.extname(fontPath).toLowerCase())) {
+    throw campaignError('Text font must use a .ttf or .otf file.', 422, 'campaign-font-extension');
+  }
+  try {
+    if (!fs.statSync(fontPath).isFile()) throw new Error('not-a-file');
+  } catch {
+    throw campaignError('The selected text font was not found.', 422, 'campaign-font-missing');
+  }
+  return fontPath;
+}
+
+function normalizeCampaignRecipeInput(raw, source, outputIndex) {
+  const input = isObjectRecord(raw) ? raw : {};
+  const layout = ['vertical-9x16', 'square-1x1', 'keep'].includes(input.layout) ? input.layout : 'vertical-9x16';
+  const cropMode = ['smart', 'fit', 'none'].includes(input.crop) ? input.crop : 'smart';
+  const speedMin = Number(input.speedMin ?? 1);
+  const speedMax = Number(input.speedMax ?? speedMin);
+  if (!Number.isFinite(speedMin) || !Number.isFinite(speedMax) || speedMin < 0.95 || speedMax > 1.05 || speedMin > speedMax) {
+    throw campaignError('Playback speed must be between 0.95 and 1.05.', 422, 'campaign-speed-range');
+  }
+  // Cycling through seven visible pace values gives each planned output an
+  // explicit recipe.  The actual pace is persisted and shown in the campaign;
+  // it is never a hidden fingerprinting change.
+  const step = ((outputIndex - 1) % 7) / 6;
+  const pace = Math.round((speedMin + (speedMax - speedMin) * step) * 10_000) / 10_000;
+  let crop = null;
+  let scale = null;
+  if (layout !== 'keep') {
+    const aspect = layout === 'vertical-9x16' ? '9:16' : '1:1';
+    const width = 1080;
+    const height = layout === 'vertical-9x16' ? 1920 : 1080;
+    if (cropMode === 'smart') {
+      crop = { aspect, position: 'center' };
+      scale = { width, height, fit: 'stretch' };
+    } else {
+      // “Fit” and “do not crop” preserve the entire source with padding.
+      scale = { width, height, fit: 'contain' };
+    }
+  }
+  const overlayPath = normalizeProcessingOverlay(input.overlayPath);
+  let overlay = null;
+  if (overlayPath) {
+    const overlayOpacity = Number(input.overlayOpacity ?? 1);
+    const overlayWidth = Number(input.overlayWidth ?? 240);
+    const overlayBlurMinPx = Number(input.overlayBlurMin ?? 0);
+    const overlayBlurMaxPx = Number(input.overlayBlurMax ?? overlayBlurMinPx);
+    const overlayPosition = String(input.overlayPosition || 'bottom-right');
+    if (!Number.isFinite(overlayOpacity) || overlayOpacity < 0.05 || overlayOpacity > 1) {
+      throw campaignError('Overlay opacity must be between 5% and 100%.', 422, 'campaign-overlay-opacity');
+    }
+    if (!Number.isInteger(overlayWidth) || overlayWidth < 2 || overlayWidth > 7_680 || overlayWidth % 2 !== 0) {
+      throw campaignError('Overlay width must be an even number from 2 to 7680.', 422, 'campaign-overlay-width');
+    }
+    if (!Number.isFinite(overlayBlurMinPx) || !Number.isFinite(overlayBlurMaxPx)
+      || overlayBlurMinPx < 0 || overlayBlurMaxPx > 20 || overlayBlurMinPx > overlayBlurMaxPx) {
+      throw campaignError('Overlay blur must be a range from 0 to 20 px.', 422, 'campaign-overlay-blur');
+    }
+    overlay = {
+      filePath: overlayPath,
+      position: overlayPosition,
+      opacity: overlayOpacity,
+      width: overlayWidth,
+      margin: 24,
+      // The engine accepts a declared 0..1 amount.  The UI displays the
+      // equivalent visible 0..20 px range, and every resolved value is kept
+      // in the persisted recipe for inspection.
+      blur: { min: overlayBlurMinPx / 20, max: overlayBlurMaxPx / 20 },
+    };
+  }
+
+  const textVariations = normalizeCampaignTextVariations(input.textVariations);
+  let text = null;
+  if (textVariations.length) {
+    const textSize = Number(input.textSize ?? 70);
+    const textY = Number(input.textY ?? 65);
+    if (!Number.isInteger(textSize) || textSize < 8 || textSize > 512) {
+      throw campaignError('Text size must be an integer from 8 to 512 px.', 422, 'campaign-text-size');
+    }
+    if (!Number.isFinite(textY) || textY < 5 || textY > 95) {
+      throw campaignError('Text position must be between 5% and 95%.', 422, 'campaign-text-position');
+    }
+    text = {
+      value: textVariations[(outputIndex - 1) % textVariations.length],
+      fontFile: normalizeCampaignFontPath(input.fontPath),
+      size: textSize,
+      position: 'bottom-center',
+      yPercent: textY,
+      color: campaignTextColor(input.textColorMode, outputIndex),
+      outline: input.textOutline === true,
+      margin: 48,
+    };
+  }
+
+  let color = null;
+  if (input.colorCorrectionEnabled === true) {
+    const amount = Number(input.colorStrength ?? 35);
+    if (!Number.isFinite(amount) || amount < 0 || amount > 100) {
+      throw campaignError('Color correction amount must be between 0% and 100%.', 422, 'campaign-color-strength');
+    }
+    if (amount > 0) {
+      color = { level: amount <= 35 ? 'weak' : amount <= 70 ? 'medium' : 'strong', amount };
+    }
+  }
+
+  let video = null;
+  const requestedFps = input.fps;
+  const requestedBitrate = input.bitrateKbps;
+  if (requestedFps !== undefined && requestedFps !== null && requestedFps !== '' && requestedFps !== 'keep'
+    || requestedBitrate !== undefined && requestedBitrate !== null && requestedBitrate !== '') {
+    video = {};
+    if (requestedFps !== undefined && requestedFps !== null && requestedFps !== '' && requestedFps !== 'keep') {
+      const fps = Number(requestedFps);
+      if (!Number.isInteger(fps) || fps < 12 || fps > 120) {
+        throw campaignError('FPS must be an integer from 12 to 120, or “keep”.', 422, 'campaign-fps');
+      }
+      video.fps = fps;
+    }
+    if (requestedBitrate !== undefined && requestedBitrate !== null && requestedBitrate !== '') {
+      const bitrateKbps = Number(requestedBitrate);
+      if (!Number.isInteger(bitrateKbps) || bitrateKbps < 100 || bitrateKbps > 100_000) {
+        throw campaignError('Video bitrate must be an integer from 100 to 100000 Kbit/s.', 422, 'campaign-bitrate');
+      }
+      video.bitrateKbps = bitrateKbps;
+    }
+    if (!Object.keys(video).length) video = null;
+  }
+  const audioMode = String(input.audioMode || 'original');
+  const musicPath = normalizeCampaignText(input.audioPath, 'Background audio path', { maxLength: 4096 });
+  let audio;
+  if (musicPath) {
+    try {
+      if (!fs.statSync(path.resolve(musicPath)).isFile()) throw new Error('not-a-file');
+    } catch {
+      throw campaignError('The background audio file was not found.', 422, 'campaign-audio-missing');
+    }
+    if (!source.hasAudio) throw campaignError('Mixing a background track requires a source with an audio stream.', 422, 'campaign-audio-source');
+    audio = { mode: 'mix', musicPath: path.resolve(musicPath), sourceGainDb: 0, musicGainDb: -16 };
+  } else if (audioMode === 'mute') {
+    audio = { mode: 'mute' };
+  } else if (audioMode === 'normalize' && source.hasAudio) {
+    // The available recipe uses a small, explicit gain adjustment; it is
+    // recorded as such instead of claiming unknown loudness normalization.
+    audio = { mode: 'gain', gainDb: -1 };
+  } else {
+    audio = { mode: 'keep' };
+  }
+  if (input.metadataMode && input.metadataMode !== 'clean') {
+    throw campaignError('Campaign exports use technical metadata cleanup. The original metadata is kept only in the campaign record.', 422, 'campaign-metadata-mode');
+  }
+  return { crop, scale, pace, overlay, text, color, video, audio };
+}
+
+function normalizeCampaignTags(raw) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw) || raw.some(item => typeof item !== 'string')) throw campaignError('Tags must be a list of text values.', 400, 'campaign-tags');
+  if (raw.length > MAX_CAMPAIGN_TAGS) throw campaignError(`Use no more than ${MAX_CAMPAIGN_TAGS} tags.`, 422, 'campaign-tags');
+  return [...new Set(raw.map(item => normalizeCampaignText(item, 'Tag', { maxLength: 100 })).filter(Boolean))];
+}
+
+function normalizeCampaignSchedule(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) throw campaignError('Scheduled time must be a valid ISO date.', 400, 'campaign-schedule');
+  return new Date(value).toISOString();
+}
+
+function campaignTemplateValue(template, assignment, campaign) {
+  return String(template || '')
+    .replaceAll('{index}', String(assignment.outputIndex))
+    .replaceAll('{source}', assignment.sourceName)
+    .replaceAll('{profileId}', assignment.profileId || '')
+    .replaceAll('{profile}', assignment.profileId || '')
+    .replaceAll('{campaign}', String(campaign.id).slice(0, 8));
+}
+
+function findCampaignProcessingItem(assignment) {
+  const batch = processingBatches.find(candidate => candidate.id === assignment.processingBatchId);
+  return batch?.items?.find(candidate => candidate.id === assignment.processingItemId) || null;
+}
+
+function findCampaignUploadTask(assignment) {
+  return assignment.uploadTaskId ? tasks.find(task => task.id === assignment.uploadTaskId) : null;
+}
+
+function campaignSummary(campaign) {
+  const summary = { total: campaign.assignments?.length || 0, queued: 0, processing: 0, completed: 0, prepared: 0, awaitingReview: 0, errors: 0, recoveryNeeded: 0 };
+  for (const assignment of campaign.assignments || []) {
+    const status = assignment.status || 'queued';
+    if (status === 'processing') summary.processing += 1;
+    else if (status === 'completed') summary.completed += 1;
+    else if (status === 'ready-for-upload') summary.prepared += 1;
+    else if (status === 'awaiting-review') summary.awaitingReview += 1;
+    else if (status === 'error') summary.errors += 1;
+    else if (status === 'recovery-needed') summary.recoveryNeeded += 1;
+    else summary.queued += 1;
+  }
+  return summary;
+}
+
+function refreshMediaCampaignStatus(campaign) {
+  const summary = campaignSummary(campaign);
+  const total = summary.total;
+  let status = 'queued';
+  if (!total) status = 'needs-attention';
+  else if (summary.processing) status = 'running';
+  else if (summary.queued) status = 'queued';
+  else if (summary.recoveryNeeded || summary.errors) status = 'needs-attention';
+  else if (summary.awaitingReview) status = 'awaiting-review';
+  else if (summary.prepared) status = 'ready-for-upload';
+  else if (summary.completed === total) status = 'completed';
+  if (campaign.status !== status) {
+    campaign.status = status;
+    campaign.updatedAt = new Date().toISOString();
+  }
+  return summary;
+}
+
+function publicMediaCampaign(campaign) {
+  const summary = campaignSummary(campaign);
+  return {
+    id: campaign.id,
+    name: campaign.name || '',
+    createdAt: campaign.createdAt,
+    updatedAt: campaign.updatedAt,
+    status: campaign.status,
+    autoRun: campaign.autoRun === true,
+    distributionEnabled: campaign.distributionEnabled === true,
+    sourcePaths: campaign.sourcePaths || [],
+    outputCount: campaign.outputCount,
+    outputFolder: campaign.outputFolder,
+    outputTemplate: campaign.outputTemplate,
+    profileIds: campaign.profileIds || [],
+    processingConcurrency: campaign.processingConcurrency,
+    uploadConcurrency: campaign.uploadConcurrency,
+    scheduledAt: campaign.scheduledAt || null,
+    duplicateRenderGroups: campaign.duplicateRenderGroups || [],
+    ...summary,
+    assignments: (campaign.assignments || []).map(assignment => ({
+      id: assignment.id,
+      outputIndex: assignment.outputIndex,
+      sourceName: assignment.sourceName,
+      sourcePath: assignment.sourcePath,
+      outputPath: assignment.outputPath,
+      profileId: assignment.profileId || '',
+      status: assignment.status,
+      message: cleanAccountText(assignment.message, 600),
+      error: cleanAccountText(assignment.error, 600),
+      recipe: assignment.recipe ? {
+        recipeId: assignment.recipe.recipeId,
+        renderSignature: assignment.recipe.renderSignature,
+        materialChanges: assignment.recipe.materialChanges || [],
+        edits: assignment.recipe.edits,
+      } : null,
+      duplicateRenderGroupSize: assignment.duplicateRenderGroupSize || 1,
+      uploadTaskId: assignment.uploadTaskId || null,
+      uploadStatus: assignment.uploadStatus || null,
+      updatedAt: assignment.updatedAt,
+    })),
+  };
+}
+
+function createCampaignUploadTask(campaign, assignment) {
+  if (!campaign.distributionEnabled || !assignment.profileId || assignment.uploadTaskId) return false;
+  const title = campaignTemplateValue(campaign.titleTemplate, assignment, campaign).trim();
+  if (!title || title.length > 100) {
+    assignment.status = 'error';
+    assignment.error = 'The title template produced an invalid title for this output.';
+    assignment.message = 'Задание загрузки не создано: проверьте шаблон заголовка.';
+    return true;
+  }
+  const description = campaignTemplateValue(campaign.descriptionTemplate, assignment, campaign);
+  if (description.length > 5000) {
+    assignment.status = 'error';
+    assignment.error = 'The description template produced text longer than 5000 characters.';
+    assignment.message = 'Задание загрузки не создано: описание слишком длинное.';
+    return true;
+  }
+  const now = new Date().toISOString();
+  const task = {
+    id: crypto.randomUUID(),
+    profileId: assignment.profileId,
+    videoPath: assignment.outputPath,
+    title,
+    description,
+    tags: campaign.tags || [],
+    scheduledAt: campaign.scheduledAt || null,
+    // A campaign prepares a real Studio upload task but never performs a
+    // browser action merely because rendering has completed.
+    autoUpload: false,
+    source: 'campaign-upload-plan',
+    campaignId: campaign.id,
+    campaignAssignmentId: assignment.id,
+    status: 'queued',
+    createdAt: now,
+    updatedAt: now,
+  };
+  tasks.push(task);
+  assignment.uploadTaskId = task.id;
+  assignment.uploadStatus = task.status;
+  assignment.status = 'ready-for-upload';
+  assignment.message = 'Готовый файл добавлен в план загрузки выбранного профиля.';
+  assignment.updatedAt = now;
+  return true;
+}
+
+function syncMediaCampaignProgress() {
+  let changed = false;
+  for (const campaign of mediaCampaigns) {
+    for (const assignment of campaign.assignments || []) {
+      const processingItem = findCampaignProcessingItem(assignment);
+      if (processingItem) {
+        const next = processingItem.status === 'running' ? 'processing'
+          : processingItem.status === 'completed' ? (campaign.distributionEnabled ? 'ready-for-upload' : 'completed')
+            : processingItem.status === 'error' ? 'error'
+              : processingItem.status === 'recovery-needed' ? 'recovery-needed'
+                : 'queued';
+        if (assignment.status !== next || assignment.error !== (processingItem.error || '') || assignment.message !== (processingItem.message || '')) {
+          assignment.status = next;
+          assignment.error = processingItem.error || '';
+          assignment.message = processingItem.message || '';
+          assignment.updatedAt = new Date().toISOString();
+          changed = true;
+        }
+        if (processingItem.status === 'completed' && createCampaignUploadTask(campaign, assignment)) changed = true;
+      }
+      const uploadTask = findCampaignUploadTask(assignment);
+      if (uploadTask) {
+        const uploadStatus = uploadTask.status;
+        if (assignment.uploadStatus !== uploadStatus) {
+          assignment.uploadStatus = uploadStatus;
+          if (uploadStatus === 'awaiting-review') assignment.status = 'awaiting-review';
+          else if (uploadStatus === 'error') { assignment.status = 'error'; assignment.error = uploadTask.error || assignment.error; }
+          else if (uploadStatus === 'cancelled') assignment.status = 'ready-for-upload';
+          assignment.updatedAt = new Date().toISOString();
+          changed = true;
+        }
+      }
+    }
+    const before = campaign.status;
+    refreshMediaCampaignStatus(campaign);
+    if (campaign.status !== before) changed = true;
+  }
+  if (changed) saveState();
+  return changed;
+}
+
+function createMediaCampaign(body) {
+  const sources = normalizeCampaignSources(body);
+  const outputCount = normalizeCampaignOutputCount(body?.outputCount);
+  const outputFolder = normalizeCampaignOutputFolder(body?.outputFolder);
+  const outputTemplate = normalizeCampaignOutputTemplate(body?.outputTemplate);
+  const distributionEnabled = body?.distributionEnabled === true;
+  const profileIds = normalizeCampaignProfileIds(body?.profileIds, distributionEnabled);
+  const processingConcurrency = body?.processingConcurrency === undefined ? 1 : Number(body.processingConcurrency);
+  if (!Number.isInteger(processingConcurrency) || processingConcurrency < 1 || processingConcurrency > MAX_PROCESSING_CONCURRENCY) {
+    throw campaignError(`Choose from 1 to ${MAX_PROCESSING_CONCURRENCY} local processing workers.`, 422, 'campaign-processing-concurrency');
+  }
+  const uploadConcurrency = body?.uploadConcurrency === undefined ? 1 : Number(body.uploadConcurrency);
+  if (!Number.isInteger(uploadConcurrency) || uploadConcurrency < 1 || uploadConcurrency > MAX_CAMPAIGN_PROFILES) {
+    throw campaignError(`Choose from 1 to ${MAX_CAMPAIGN_PROFILES} upload workers.`, 422, 'campaign-upload-concurrency');
+  }
+  const titleTemplate = normalizeCampaignText(body?.titleTemplate, 'Title template', { required: distributionEnabled, maxLength: 100 });
+  const descriptionTemplate = normalizeCampaignText(body?.descriptionTemplate, 'Description template', { maxLength: 5000 });
+  const tags = normalizeCampaignTags(body?.tags);
+  const scheduledAt = normalizeCampaignSchedule(body?.scheduledAt);
+  const autoRun = body?.autoStart === true;
+  const addToLibrary = body?.recipe?.addToLibrary !== false;
+  const campaignId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const seenOutputs = new Set();
+  const assignments = [];
+  const chunks = [];
+  let chunkItems = [];
+  for (let outputIndex = 1; outputIndex <= outputCount; outputIndex += 1) {
+    const source = sources[(outputIndex - 1) % sources.length];
+    const outputPath = campaignOutputPath(outputFolder, outputTemplate, source, outputIndex, campaignId);
+    if (seenOutputs.has(outputPath)) throw campaignError('The output filename template creates duplicate paths. Include {index} in the filename.', 422, 'campaign-duplicate-output');
+    if (fs.existsSync(outputPath)) throw campaignError(`Output file already exists: ${path.basename(outputPath)}`, 409, 'campaign-output-exists');
+    if (processingOutputIsReserved(outputPath)) {
+      throw campaignError(`Another local processing task already reserves: ${path.basename(outputPath)}`, 409, 'campaign-output-reserved');
+    }
+    seenOutputs.add(outputPath);
+    const edits = normalizeCampaignRecipeInput(body?.recipe, source, outputIndex);
+    const profileId = distributionEnabled ? profileIds[(outputIndex - 1) % profileIds.length] : '';
+    const recipe = createEditorialRecipe({ source: { id: source.id, filePath: source.filePath, hasAudio: source.hasAudio }, campaignId, variantIndex: outputIndex, profileId: profileId || 'local-render', edits });
+    const assignmentId = crypto.randomUUID();
+    const itemId = crypto.randomUUID();
+    const assignment = {
+      id: assignmentId,
+      outputIndex,
+      sourceName: campaignSourceName(source),
+      sourcePath: source.filePath,
+      outputPath,
+      profileId,
+      status: 'queued',
+      message: 'Ожидает запуска локальной обработки.',
+      error: '',
+      recipe,
+      createdAt: now,
+      updatedAt: now,
+      processingItemId: itemId,
+      processingBatchId: '',
+    };
+    const item = {
+      id: itemId,
+      inputPath: source.filePath,
+      outputPath,
+      status: 'queued',
+      createdAt: now,
+      updatedAt: now,
+      message: 'Ожидает запуска локальной обработки.',
+      error: '',
+      recipe,
+      addToLibrary,
+      campaignId,
+      campaignAssignmentId: assignmentId,
+    };
+    assignments.push(assignment);
+    chunkItems.push(item);
+    if (chunkItems.length === MAX_PROCESSING_BATCH_SIZE || outputIndex === outputCount) {
+      chunks.push(chunkItems);
+      chunkItems = [];
+    }
+  }
+  if (mediaCampaigns.length >= MAX_MEDIA_CAMPAIGNS) throw campaignError(`Keep no more than ${MAX_MEDIA_CAMPAIGNS} saved campaigns.`, 409, 'campaign-history-full');
+  if (processingBatches.length + chunks.length > MAX_PROCESSING_BATCHES) {
+    throw campaignError('The local processing history is full. Finish or remove old processing batches before creating this campaign.', 409, 'campaign-processing-capacity');
+  }
+  const campaign = {
+    id: campaignId,
+    name: normalizeCampaignText(body?.name, 'Campaign name', { maxLength: 120 }) || `Кампания ${now.slice(0, 16).replace('T', ' ')}`,
+    createdAt: now,
+    updatedAt: now,
+    status: 'queued',
+    autoRun,
+    distributionEnabled,
+    sourcePaths: sources.map(source => source.filePath),
+    outputCount,
+    outputFolder,
+    outputTemplate,
+    profileIds,
+    titleTemplate,
+    descriptionTemplate,
+    tags,
+    scheduledAt,
+    processingConcurrency,
+    uploadConcurrency,
+    assignments,
+    duplicateRenderGroups: [],
+    processingBatchIds: [],
+  };
+  const signatureGroups = new Map();
+  for (const assignment of assignments) {
+    const group = signatureGroups.get(assignment.recipe.renderSignature) || [];
+    group.push(assignment);
+    signatureGroups.set(assignment.recipe.renderSignature, group);
+  }
+  campaign.duplicateRenderGroups = [...signatureGroups.entries()]
+    .filter(([, group]) => group.length > 1)
+    .map(([renderSignature, group]) => ({ renderSignature, outputIndexes: group.map(item => item.outputIndex) }));
+  for (const group of signatureGroups.values()) {
+    for (const assignment of group) assignment.duplicateRenderGroupSize = group.length;
+  }
+  const batches = chunks.map(items => {
+    const batch = {
+      id: crypto.randomUUID(),
+      source: 'campaign-processing',
+      campaignId,
+      createdAt: now,
+      updatedAt: now,
+      status: 'queued',
+      concurrency: processingConcurrency,
+      autoRun: false,
+      items,
+    };
+    for (const item of items) {
+      const assignment = assignments.find(candidate => candidate.id === item.campaignAssignmentId);
+      if (assignment) assignment.processingBatchId = batch.id;
+    }
+    campaign.processingBatchIds.push(batch.id);
+    refreshProcessingBatchStatus(batch);
+    return batch;
+  });
+  refreshMediaCampaignStatus(campaign);
+  return { campaign, batches };
 }
 
 const MAX_BULK_UPLOAD_TASKS = 100;
@@ -2349,6 +3072,86 @@ app.post('/api/processing/batches/:batchId/items/:itemId/retry', async (req, res
     return res.status(202).json({ batch: publicProcessingBatch(batch), item: publicProcessingBatch({ ...batch, items: [item] }).items[0] });
   } catch (error) {
     return res.status(error.statusCode || 422).json({ error: error.message, code: error.code || 'processing-retry-failed' });
+  }
+});
+
+app.get('/api/campaigns', (_req, res) => {
+  syncMediaCampaignProgress();
+  res.json({
+    campaigns: mediaCampaigns.slice(0, MAX_MEDIA_CAMPAIGNS).map(publicMediaCampaign),
+    processor: { active: activeProcessingJobIds.size, limit: MAX_PROCESSING_CONCURRENCY },
+  });
+});
+
+app.get('/api/campaigns/:id', (req, res) => {
+  syncMediaCampaignProgress();
+  const campaign = mediaCampaigns.find(item => item.id === req.params.id);
+  if (!campaign) return res.status(404).json({ error: 'Кампания не найдена.', code: 'campaign-not-found' });
+  return res.json({ campaign: publicMediaCampaign(campaign) });
+});
+
+app.post('/api/campaigns', (req, res) => {
+  let staged;
+  try {
+    staged = createMediaCampaign(req.body || {});
+  } catch (error) {
+    return res.status(error.statusCode || 422).json({ error: error.message, code: error.code || 'campaign-validation-failed' });
+  }
+  try {
+    mediaCampaigns.unshift(staged.campaign);
+    processingBatches.unshift(...staged.batches);
+    saveState();
+  } catch (error) {
+    const campaignIndex = mediaCampaigns.indexOf(staged.campaign);
+    if (campaignIndex >= 0) mediaCampaigns.splice(campaignIndex, 1);
+    for (const batch of staged.batches) {
+      const index = processingBatches.indexOf(batch);
+      if (index >= 0) processingBatches.splice(index, 1);
+    }
+    return res.status(500).json({ error: `Campaign was not saved: ${error.message}`, code: 'campaign-save-failed' });
+  }
+  addLog(`Создана кампания локальной обработки: ${staged.campaign.outputCount} результатов.`, null, 'info');
+  if (staged.campaign.autoRun) {
+    for (const batch of staged.batches) batch.autoRun = true;
+    staged.campaign.updatedAt = new Date().toISOString();
+    saveState();
+    if (backgroundEnabled) {
+      queueMicrotask(() => processProcessingBatches().catch(error => addLog(`Ошибка запуска кампании: ${error.message}`, staged.campaign.id, 'error')));
+    }
+  }
+  return res.status(201).json({ campaign: publicMediaCampaign(staged.campaign), processor: { active: activeProcessingJobIds.size, limit: MAX_PROCESSING_CONCURRENCY } });
+});
+
+app.post('/api/campaigns/:id/run', async (req, res) => {
+  const campaign = mediaCampaigns.find(item => item.id === req.params.id);
+  if (!campaign) return res.status(404).json({ error: 'Кампания не найдена.', code: 'campaign-not-found' });
+  if (['completed', 'ready-for-upload', 'awaiting-review'].includes(campaign.status)) {
+    return res.status(409).json({ error: 'В кампании нет новых локальных задач для запуска.', code: 'campaign-no-queued-items', campaign: publicMediaCampaign(campaign) });
+  }
+  try {
+    const retryFailed = req.body?.retryFailed === true;
+    const batches = processingBatches.filter(batch => batch.campaignId === campaign.id);
+    if (!batches.length) throw campaignError('У этой кампании не найдены задания обработки.', 409, 'campaign-no-batches');
+    for (const batch of batches) {
+      if (retryFailed) {
+        for (const item of batch.items || []) {
+          if (['error', 'recovery-needed'].includes(item.status)) queueProcessingRetry(batch, item);
+        }
+      }
+      if ((batch.items || []).some(item => item.status === 'queued')) batch.autoRun = true;
+      refreshProcessingBatchStatus(batch);
+    }
+    campaign.autoRun = true;
+    campaign.updatedAt = new Date().toISOString();
+    refreshMediaCampaignStatus(campaign);
+    saveState();
+    // A deliberate Run command starts local FFmpeg work even if background
+    // scheduling was disabled for diagnostics/tests.  It never touches
+    // Dolphin or YouTube.
+    processProcessingBatches().catch(error => addLog(`Ошибка обработки кампании: ${error.message}`, campaign.id, 'error'));
+    return res.status(202).json({ campaign: publicMediaCampaign(campaign), processor: { active: activeProcessingJobIds.size, limit: MAX_PROCESSING_CONCURRENCY } });
+  } catch (error) {
+    return res.status(error.statusCode || 422).json({ error: error.message, code: error.code || 'campaign-run-failed' });
   }
 });
 
