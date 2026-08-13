@@ -733,7 +733,10 @@ function renderChannelTasks() {
     const automatic = task.source === 'bulk-channel' ? 'пакет' : 'один канал';
     const canRun = ['queued', 'error', 'recovery-needed', 'manual-login-required'].includes(task.status);
     const detail = task.message || task.error || '';
-    return `<article class="task"><span class="number">✎</span><div class="task-copy"><div class="task-title-row"><b>${escapeHtml(task.name || 'Изменение оформления')}</b>${statusPill(task.status, taskStatusLabel(task.status))}</div><small>${escapeHtml(profileName)} · ${automatic}${detail ? ` · ${escapeHtml(detail)}` : ''}</small>${taskStage(task.status)}</div><div class="task-side"><span class="meta-tag accent">${escapeHtml(profileName)}</span><div class="profile-actions">${canRun ? `<button class="btn primary" data-channel-task="${escapeHtml(task.id)}">Применить</button>` : ''}</div></div></article>`;
+    const saveProof = task.status === 'completed' && task.result?.saveConfirmed
+      ? ' · Studio подтвердил сохранение'
+      : '';
+    return `<article class="task"><span class="number">✎</span><div class="task-copy"><div class="task-title-row"><b>${escapeHtml(task.name || 'Изменение оформления')}</b>${statusPill(task.status, taskStatusLabel(task.status))}</div><small>${escapeHtml(profileName)} · ${automatic}${detail ? ` · ${escapeHtml(detail)}` : ''}${saveProof}</small>${taskStage(task.status)}</div><div class="task-side"><span class="meta-tag accent">${escapeHtml(profileName)}</span><div class="profile-actions">${canRun ? `<button class="btn primary" data-channel-task="${escapeHtml(task.id)}">Применить</button>` : ''}</div></div></article>`;
   }).join('') : '<div class="empty">Задач оформления пока нет.</div>';
   target.querySelectorAll('[data-channel-task]').forEach(button => button.onclick = () => runChannelTask(button.dataset.channelTask, button));
 }
