@@ -4,6 +4,72 @@ const state = {
   bulkProfileIds: new Set(), channelBulkProfileIds: new Set(), campaignProfileIds: new Set(), folders: [], processingBatches: [], processingProcessor: null,
   campaigns: [], campaignApiAvailable: null,
 };
+
+// Presets are transparent starting points for local editorial processing. They
+// only populate controls that are rendered in the UI and never synthesize
+// device identities or hidden platform-facing metadata.
+const UNIQUEIZER_PRESETS = Object.freeze({
+  manual: Object.freeze({
+    id: 'manual',
+    title: 'Ручной рецепт',
+    description: 'Все параметры остаются под вашим контролем. Ничего не меняется, пока вы сами не зададите значения.',
+    values: Object.freeze({}),
+  }),
+  'shorts-balanced': Object.freeze({
+    id: 'shorts-balanced',
+    title: 'Сбалансированный Shorts',
+    description: 'Базовый рецепт для вертикального формата: центральное кадрирование, 30 FPS, умеренный диапазон скорости и мягкая цветокоррекция.',
+    values: Object.freeze({
+      outputCount: 10, layout: 'vertical-9x16', crop: 'smart', speedMin: 0.98, speedMax: 1.02,
+      fps: '30', bitrateKbps: 8000, overlayOpacity: 88, overlayBlurMin: 0, overlayBlurMax: 4,
+      textSize: 70, textY: 65, textColorMode: 'random-visible', textOutline: true,
+      colorCorrectionEnabled: true, colorStrength: 35, audioMode: 'original', metadataMode: 'clean',
+    }),
+  }),
+  'soft-editorial': Object.freeze({
+    id: 'soft-editorial',
+    title: 'Мягкий редакторский',
+    description: 'Вертикальный формат без агрессивного кадрирования, небольшой диапазон скорости, нормализация звука и деликатная цветокоррекция.',
+    values: Object.freeze({
+      outputCount: 10, layout: 'vertical-9x16', crop: 'fit', speedMin: 0.99, speedMax: 1.01,
+      fps: '30', bitrateKbps: 7500, overlayOpacity: 72, overlayBlurMin: 1, overlayBlurMax: 5,
+      textSize: 64, textY: 68, textColorMode: 'white', textOutline: true,
+      colorCorrectionEnabled: true, colorStrength: 25, audioMode: 'normalize', metadataMode: 'clean',
+    }),
+  }),
+  'square-stories': Object.freeze({
+    id: 'square-stories',
+    title: 'Квадратные истории',
+    description: 'Рецепт для квадратного 1:1: центральный кадр, 30 FPS, лёгкая цветокоррекция и сохранение исходного звука.',
+    values: Object.freeze({
+      outputCount: 10, layout: 'square-1x1', crop: 'smart', speedMin: 0.98, speedMax: 1.02,
+      fps: '30', bitrateKbps: 7000, overlayOpacity: 82, overlayBlurMin: 0, overlayBlurMax: 3,
+      textSize: 60, textY: 64, textColorMode: 'accent', textOutline: true,
+      colorCorrectionEnabled: true, colorStrength: 30, audioMode: 'original', metadataMode: 'clean',
+    }),
+  }),
+});
+
+const UNIQUEIZER_PRESET_CONTROL_MAP = Object.freeze({
+  outputCount: '#campaign-output-count',
+  layout: '#campaign-layout',
+  crop: '#campaign-crop',
+  speedMin: '#campaign-speed-min',
+  speedMax: '#campaign-speed-max',
+  fps: '#campaign-fps',
+  bitrateKbps: '#campaign-bitrate-kbps',
+  overlayOpacity: '#campaign-overlay-opacity',
+  overlayBlurMin: '#campaign-overlay-blur-min',
+  overlayBlurMax: '#campaign-overlay-blur-max',
+  textSize: '#campaign-text-size',
+  textY: '#campaign-text-y',
+  textColorMode: '#campaign-text-color-mode',
+  textOutline: '#campaign-text-outline',
+  colorCorrectionEnabled: '#campaign-color-correction-enabled',
+  colorStrength: '#campaign-color-strength',
+  audioMode: '#campaign-audio-mode',
+  metadataMode: '#campaign-metadata',
+});
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
 const pageNames = { overview: 'Главная', profiles: 'Профили Dolphin', accounts: 'Аккаунты YouTube', campaign: 'Уникализатор', queue: 'Очередь задач', library: 'Библиотека', channels: 'Каналы', processing: 'Обработка', analytics: 'Аналитика', settings: 'Настройки' };
@@ -268,6 +334,51 @@ function campaignTextVariations() {
     .filter(Boolean);
 }
 
+function currentCampaignPreset() {
+  const id = $('#campaign-preset')?.value || 'manual';
+  return UNIQUEIZER_PRESETS[id] || UNIQUEIZER_PRESETS.manual;
+}
+
+function campaignLayoutLabel(layout) {
+  return ({ 'vertical-9x16': '9:16', 'square-1x1': '1:1', keep: 'исходный формат' })[layout] || layout;
+}
+
+function renderCampaignPreset() {
+  const copy = $('#campaign-preset-copy');
+  const preview = $('#campaign-preset-preview');
+  if (!copy || !preview) return;
+  const preset = currentCampaignPreset();
+  const recipe = campaignRecipePayload();
+  const outputs = Math.max(1, Math.floor(campaignNumber('#campaign-output-count', 1)));
+  const labels = [
+    `${outputs} результатов`,
+    campaignLayoutLabel(recipe.layout),
+    `${recipe.speedMin.toFixed(2)}–${recipe.speedMax.toFixed(2)}×`,
+    recipe.fps === 'keep' ? 'исходный FPS' : `${recipe.fps} FPS`,
+    `${recipe.bitrateKbps} Кбит/с`,
+    recipe.colorCorrectionEnabled ? `цветокор ${recipe.colorStrength}%` : 'цветокор выключен',
+    recipe.overlayPath ? 'PNG подключён' : 'PNG не указан',
+    recipe.textVariations.length ? `текст: ${recipe.textVariations.length} фраз` : 'текст не задан',
+  ];
+  copy.innerHTML = `<b>${escapeHtml(preset.title)}</b> — ${escapeHtml(preset.description)}`;
+  preview.innerHTML = labels.map(label => `<span>${escapeHtml(label)}</span>`).join('');
+}
+
+function applyCampaignPreset(id) {
+  const preset = UNIQUEIZER_PRESETS[id] || UNIQUEIZER_PRESETS.manual;
+  const select = $('#campaign-preset');
+  if (select) select.value = preset.id;
+  Object.entries(preset.values).forEach(([key, value]) => {
+    const control = $(UNIQUEIZER_PRESET_CONTROL_MAP[key]);
+    if (!control) return;
+    if (control.type === 'checkbox') control.checked = Boolean(value);
+    else control.value = String(value);
+  });
+  $$('[data-range-output]').forEach(updateCampaignRangeOutput);
+  updateCampaignPlan();
+  renderCampaignPreset();
+}
+
 function updateCampaignRangeOutput(input) {
   const output = $(`#${input.dataset.rangeOutput}`);
   if (!output) return;
@@ -298,6 +409,7 @@ function updateCampaignRecipeSummary() {
   else if (recipe.audioPath) labels.push('фоновая дорожка');
   else if (recipe.audioMode === 'normalize') labels.push('громкость нормализуется');
   target.innerHTML = labels.map(label => `<span>${escapeHtml(label)}</span>`).join('');
+  renderCampaignPreset();
 }
 
 function renderCampaignProgressPreview() {
@@ -402,6 +514,7 @@ function renderCampaigns(loadError = null) {
 
 function campaignRecipePayload() {
   return {
+    presetId: currentCampaignPreset().id,
     layout: $('#campaign-layout').value,
     crop: $('#campaign-crop').value,
     speedMin: Number($('#campaign-speed-min').value),
@@ -447,12 +560,14 @@ async function createCampaign(event) {
   const bitrateKbps = campaignNumber('#campaign-bitrate-kbps', 0);
   if (!Number.isInteger(bitrateKbps) || bitrateKbps < 500 || bitrateKbps > 50000) return setMessage(message, 'Укажите битрейт от 500 до 50 000 Кбит/с.', 'error');
   const schedule = $('#campaign-schedule').value;
+  const recipe = campaignRecipePayload();
   const body = {
     sourcePaths,
     outputCount,
     outputFolder: $('#campaign-output-folder').value.trim(),
     outputTemplate: $('#campaign-output-template').value.trim(),
-    recipe: campaignRecipePayload(),
+    presetId: recipe.presetId,
+    recipe,
     profileIds: distributionEnabled ? [...state.campaignProfileIds] : [],
     distributionEnabled,
     titleTemplate: $('#campaign-title-template').value.trim(),
@@ -487,6 +602,7 @@ async function createCampaign(event) {
     renderCampaignSourcePicker();
     renderCampaignProfilePicker();
     updateCampaignDistributionControls();
+    applyCampaignPreset('manual');
     await Promise.all([loadCampaigns(), loadLogs(), loadWorkerSettings()]);
   } catch (error) {
     setMessage(message, error.message, 'error');
@@ -1249,6 +1365,7 @@ function bindEvents() {
   $('#library-import-path').onclick = importLibraryPath;
   $('#campaign-form').onsubmit = createCampaign;
   $('#campaign-refresh').onclick = () => Promise.all([loadCampaigns(), loadLibrary(), loadProfiles(), loadAccounts()]);
+  $('#campaign-preset').onchange = event => applyCampaignPreset(event.target.value);
   $('#campaign-output-count').oninput = updateCampaignPlan;
   $('#campaign-enable-distribution').onchange = updateCampaignDistributionControls;
   $('#campaign-select-connected').onclick = () => setCampaignProfiles('connected');
@@ -1278,6 +1395,7 @@ function bindEvents() {
   $('#campaign-processing-concurrency-copy').onchange = () => syncCampaignProcessingConcurrency('copy');
   syncCampaignProcessingConcurrency();
   updateCampaignRecipeSummary();
+  renderCampaignPreset();
   $('#channel-read').onclick = () => readChannel(false);
   $('#channel-form').onsubmit = createChannelTask;
   $('#channel-bulk-form').onsubmit = createBulkChannelTasks;
