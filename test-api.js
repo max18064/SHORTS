@@ -591,6 +591,7 @@ try {
         presetId: 'shorts-balanced',
         recipe: {
           presetId: 'shorts-balanced',
+          usePresetOverlay: true,
           textVariations: [],
           audioMode: 'original',
           metadataMode: 'clean',
@@ -610,6 +611,8 @@ try {
     assert.equal(new Set(presetCampaign.assignments.map(item => item.recipe.renderSignature)).size, 10);
     assert.ok(presetCampaign.assignments.every(item => item.recipe.edits.crop?.aspect === '9:16'));
     assert.ok(presetCampaign.assignments.every(item => item.recipe.edits.video?.fps));
+    assert.ok(presetCampaign.assignments.every(item => item.recipe.edits.overlay?.filePath?.endsWith('.png')));
+    assert.ok(presetCampaign.assignments.every(item => fs.existsSync(item.recipe.edits.overlay.filePath)));
     assert.deepEqual(presetCampaign.duplicateRenderGroups, []);
     const invalidPresetCampaign = await fetch(`${base}/api/campaigns`, {
       method: 'POST',
@@ -723,7 +726,7 @@ try {
         outputFolder: testStateDir,
         outputTemplate: 'campaign-preset-render-{index}.mp4',
         presetId: 'shorts-balanced',
-        recipe: { presetId: 'shorts-balanced', audioMode: 'original', metadataMode: 'clean', addToLibrary: false },
+        recipe: { presetId: 'shorts-balanced', usePresetOverlay: true, audioMode: 'original', metadataMode: 'clean', addToLibrary: false },
         distributionEnabled: false,
         profileIds: [],
         autoStart: false,
@@ -734,6 +737,7 @@ try {
     assert.equal(presetRenderResponse.status, 201);
     const presetRenderCampaign = (await presetRenderResponse.json()).campaign;
     assert.equal(presetRenderCampaign.assignments[0].recipe.edits.crop.aspect, '9:16');
+    assert.ok(presetRenderCampaign.assignments[0].recipe.edits.overlay.filePath.endsWith('.png'));
     const presetRun = await fetch(`${base}/api/campaigns/${presetRenderCampaign.id}/run`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}),
     });

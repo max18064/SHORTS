@@ -10,6 +10,7 @@ import { openUploadSession, uploadIntoSession, uploadOwnVideo } from './upload-w
 import { inspectChannel, updateChannelBranding } from './channel-worker.js';
 import { readStudioVideos } from './studio-reader.js';
 import { inspectMediaFile } from './media-inspector.js';
+import { ensurePresetOverlayAssets } from './preset-overlay-assets.js';
 import {
   MAX_EDITORIAL_CAMPAIGN_OUTPUTS,
   buildFfmpegArgs,
@@ -72,6 +73,12 @@ const statePath = process.env.CREATOR_FLOW_STATE_PATH || path.join(root, '.creat
 const isolatedState = Boolean(process.env.CREATOR_FLOW_STATE_PATH);
 const libraryDir = isolatedState ? path.join(path.dirname(statePath), 'library') : path.join(root, 'data', 'library');
 fs.mkdirSync(libraryDir, { recursive: true });
+// Named uniqueizer presets can use these visible, locally generated PNG cards
+// without asking the operator to locate or upload an image file.
+const presetOverlayDir = isolatedState
+  ? path.join(path.dirname(statePath), 'preset-overlays')
+  : path.join(root, 'data', 'preset-overlays');
+const presetOverlayPaths = ensurePresetOverlayAssets({ directory: presetOverlayDir });
 const isLegacySmokeRecord = item => item?.title === 'Smoke test' && item?.profileId === 'test-profile' && item?.videoPath === 'C:/test.mp4' && Number(item?.views) === 301 && item?.status === 'published';
 const isLegacySmokeProxy = item => item?.host === '127.0.0.1' && Number(item?.port) === 8080 && item?.type === 'http' && item?.username === '' && item?.password === '' && item?.status === 'unverified' && Number(item?.sourceLine) === 1;
 let stateNeedsCleanup = false;
@@ -1154,6 +1161,36 @@ function normalizeCampaignPresetId(body) {
   return presetId;
 }
 
+function campaignUsesBuiltInPresetOverlay(body, presetId) {
+  const requested = body?.recipe?.usePresetOverlay;
+  if (requested !== undefined && typeof requested !== 'boolean') {
+    throw campaignError('The built-in color-card option must be on or off.', 400, 'campaign-preset-overlay-invalid');
+  }
+  // A named preset is meant to be usable without any additional image files.
+  // The switch still lets an operator use their own PNG instead.
+  return presetId !== 'manual' && requested !== false;
+}
+
+function builtInPresetOverlayFor(presetId, outputIndex) {
+  if (!Array.isArray(presetOverlayPaths) || !presetOverlayPaths.length) {
+    throw campaignError('Built-in PNG color cards are unavailable.', 500, 'campaign-preset-overlay-unavailable');
+  }
+  const presetOffsets = { 'shorts-balanced': 0, 'soft-editorial': 3, 'square-stories': 6 };
+  const offset = presetOffsets[presetId] ?? 0;
+  const index = (Math.max(1, Number(outputIndex) || 1) - 1 + offset) % presetOverlayPaths.length;
+  const positions = ['bottom-right', 'bottom-left', 'top-right', 'top-left'];
+  const opacities = [0.55, 0.62, 0.68, 0.58, 0.72];
+  const widths = [220, 250, 280, 310, 340];
+  return {
+    filePath: presetOverlayPaths[index],
+    position: positions[(index + offset) % positions.length],
+    opacity: opacities[index % opacities.length],
+    width: widths[(index + offset) % widths.length],
+    margin: 36,
+    blur: 0,
+  };
+}
+
 function normalizeCampaignRecipeInput(raw, source, outputIndex) {
   const input = isObjectRecord(raw) ? raw : {};
   const layout = ['vertical-9x16', 'square-1x1', 'keep'].includes(input.layout) ? input.layout : 'vertical-9x16';
@@ -1182,7 +1219,7 @@ function normalizeCampaignRecipeInput(raw, source, outputIndex) {
       scale = { width, height, fit: 'contain' };
     }
   }
-  const overlayPath = normalizeProcessingOverlay(input.overlayPath);
+  const overlayPath = input.usePresetOverlay === true ? '' : normalizeProcessingOverlay(input.overlayPath);
   let overlay = null;
   if (overlayPath) {
     const overlayOpacity = Number(input.overlayOpacity ?? 1);
@@ -1369,6 +1406,7 @@ function publicMediaCampaign(campaign) {
     status: campaign.status,
     autoRun: campaign.autoRun === true,
     presetId: campaign.presetId || 'manual',
+    usesBuiltInPresetOverlay: campaign.usesBuiltInPresetOverlay === true,
     distributionEnabled: campaign.distributionEnabled === true,
     sourcePaths: campaign.sourcePaths || [],
     outputCount: campaign.outputCount,
@@ -1512,6 +1550,7 @@ function createMediaCampaign(body) {
   const addToLibrary = body?.recipe?.addToLibrary !== false;
   const campaignId = crypto.randomUUID();
   const presetId = normalizeCampaignPresetId(body);
+  const usesBuiltInPresetOverlay = campaignUsesBuiltInPresetOverlay(body, presetId);
   const now = new Date().toISOString();
   const seenOutputs = new Set();
   const assignments = [];
@@ -1527,7 +1566,11 @@ function createMediaCampaign(body) {
     }
     seenOutputs.add(outputPath);
     const profileId = distributionEnabled ? profileIds[(outputIndex - 1) % profileIds.length] : '';
-    const baseEdits = normalizeCampaignRecipeInput(body?.recipe, source, outputIndex);
+    const recipeInput = usesBuiltInPresetOverlay
+      ? { ...(isObjectRecord(body?.recipe) ? body.recipe : {}), usePresetOverlay: true }
+      : body?.recipe;
+    const baseEdits = normalizeCampaignRecipeInput(recipeInput, source, outputIndex);
+    if (usesBuiltInPresetOverlay) baseEdits.overlay = builtInPresetOverlayFor(presetId, outputIndex);
     const edits = resolveEditorialPreset({
       presetId,
       baseEdits,
@@ -1588,6 +1631,7 @@ function createMediaCampaign(body) {
     status: 'queued',
     autoRun,
     presetId,
+    usesBuiltInPresetOverlay,
     distributionEnabled,
     sourcePaths: sources.map(source => source.filePath),
     outputCount,

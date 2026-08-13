@@ -1399,8 +1399,7 @@ function bindEvents() {
   $('#campaign-processing-concurrency').onchange = () => syncCampaignProcessingConcurrency();
   $('#campaign-processing-concurrency-copy').onchange = () => syncCampaignProcessingConcurrency('copy');
   syncCampaignProcessingConcurrency();
-  updateCampaignRecipeSummary();
-  renderCampaignPreset();
+  applyCampaignPreset(currentCampaignPreset().id);
   $('#channel-read').onclick = () => readChannel(false);
   $('#channel-form').onsubmit = createChannelTask;
   $('#channel-bulk-form').onsubmit = createBulkChannelTasks;
