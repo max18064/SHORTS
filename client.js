@@ -23,7 +23,7 @@ const UNIQUEIZER_PRESETS = Object.freeze({
       outputCount: 10, layout: 'vertical-9x16', crop: 'smart', speedMin: 0.98, speedMax: 1.02,
       fps: '30', bitrateKbps: 8000, overlayOpacity: 88, overlayBlurMin: 0, overlayBlurMax: 4,
       textSize: 70, textY: 65, textColorMode: 'random-visible', textOutline: true,
-      colorCorrectionEnabled: true, colorStrength: 35, audioMode: 'original', metadataMode: 'clean',
+      colorCorrectionEnabled: true, colorStrength: 35, audioMode: 'original', metadataPresetId: 'clean',
     }),
   }),
   'soft-editorial': Object.freeze({
@@ -34,7 +34,7 @@ const UNIQUEIZER_PRESETS = Object.freeze({
       outputCount: 10, layout: 'vertical-9x16', crop: 'fit', speedMin: 0.99, speedMax: 1.01,
       fps: '30', bitrateKbps: 7500, overlayOpacity: 72, overlayBlurMin: 1, overlayBlurMax: 5,
       textSize: 64, textY: 68, textColorMode: 'white', textOutline: true,
-      colorCorrectionEnabled: true, colorStrength: 25, audioMode: 'normalize', metadataMode: 'clean',
+      colorCorrectionEnabled: true, colorStrength: 25, audioMode: 'normalize', metadataPresetId: 'clean',
     }),
   }),
   'square-stories': Object.freeze({
@@ -45,7 +45,7 @@ const UNIQUEIZER_PRESETS = Object.freeze({
       outputCount: 10, layout: 'square-1x1', crop: 'smart', speedMin: 0.98, speedMax: 1.02,
       fps: '30', bitrateKbps: 7000, overlayOpacity: 82, overlayBlurMin: 0, overlayBlurMax: 3,
       textSize: 60, textY: 64, textColorMode: 'accent', textOutline: true,
-      colorCorrectionEnabled: true, colorStrength: 30, audioMode: 'original', metadataMode: 'clean',
+      colorCorrectionEnabled: true, colorStrength: 30, audioMode: 'original', metadataPresetId: 'clean',
     }),
   }),
 });
@@ -68,7 +68,28 @@ const UNIQUEIZER_PRESET_CONTROL_MAP = Object.freeze({
   colorCorrectionEnabled: '#campaign-color-correction-enabled',
   colorStrength: '#campaign-color-strength',
   audioMode: '#campaign-audio-mode',
-  metadataMode: '#campaign-metadata',
+  metadataPresetId: '#campaign-metadata-preset',
+});
+
+const EXPORT_METADATA_PRESETS = Object.freeze({
+  clean: Object.freeze({
+    id: 'clean',
+    title: 'Очистить экспортные поля',
+    description: 'Очищает технические поля при переэкспорте. Устройство, даты съёмки и идентификаторы не задаются и не изменяются.',
+    summary: 'очистка полей',
+  }),
+  'source-title': Object.freeze({
+    id: 'source-title',
+    title: 'Название исходника',
+    description: 'Использует только название исходного ролика в заголовке экспорта. Устройство, даты съёмки и идентификаторы не изменяются.',
+    summary: 'название исходника',
+  }),
+  'project-export': Object.freeze({
+    id: 'project-export',
+    title: 'Проектный экспорт',
+    description: 'Добавляет в экспортные поля название кампании и номер версии. Устройство, даты съёмки и идентификаторы не изменяются.',
+    summary: 'кампания и номер версии',
+  }),
 });
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
@@ -339,6 +360,45 @@ function currentCampaignPreset() {
   return UNIQUEIZER_PRESETS[id] || UNIQUEIZER_PRESETS.manual;
 }
 
+function currentCampaignMetadataPreset() {
+  const id = $('#campaign-metadata-preset')?.value || 'clean';
+  return EXPORT_METADATA_PRESETS[id] || EXPORT_METADATA_PRESETS.clean;
+}
+
+function campaignMetadataLines() {
+  return String($('#campaign-metadata-lines')?.value || '')
+    .split(/\r?\n/)
+    .map(value => value.trim())
+    .filter(Boolean);
+}
+
+function renderCampaignMetadataPreset() {
+  const target = $('#campaign-metadata-preset-copy');
+  if (!target) return;
+  target.textContent = currentCampaignMetadataPreset().description;
+}
+
+async function importCampaignMetadataFile(event) {
+  const input = event.currentTarget;
+  const file = input?.files?.[0];
+  if (!file) return;
+  if (!/\.(txt|csv)$/i.test(file.name)) {
+    input.value = '';
+    return setMessage('#campaign-metadata-import-status', 'Выберите TXT или CSV с одной строкой «Название | Комментарий» для каждой версии.', 'error');
+  }
+  try {
+    const text = await file.text();
+    const textarea = $('#campaign-metadata-lines');
+    if (textarea) textarea.value = text.replace(/\r\n?/g, '\n').trim();
+    setMessage('#campaign-metadata-import-status', `Подставлено строк: ${campaignMetadataLines().length}. Файл не отправлялся на сервер.`);
+    updateCampaignRecipeSummary();
+  } catch (error) {
+    setMessage('#campaign-metadata-import-status', `Не удалось прочитать файл: ${error.message}`, 'error');
+  } finally {
+    input.value = '';
+  }
+}
+
 function campaignLayoutLabel(layout) {
   return ({ 'vertical-9x16': '9:16', 'square-1x1': '1:1', keep: 'исходный формат' })[layout] || layout;
 }
@@ -348,6 +408,7 @@ function renderCampaignPreset() {
   const preview = $('#campaign-preset-preview');
   if (!copy || !preview) return;
   const preset = currentCampaignPreset();
+  const metadataPreset = currentCampaignMetadataPreset();
   const recipe = campaignRecipePayload();
   const outputs = Math.max(1, Math.floor(campaignNumber('#campaign-output-count', 1)));
   const labels = [
@@ -357,6 +418,7 @@ function renderCampaignPreset() {
     recipe.fps === 'keep' ? 'исходный FPS' : `${recipe.fps} FPS`,
     `${recipe.bitrateKbps} Кбит/с`,
     recipe.colorCorrectionEnabled ? `цветокор ${recipe.colorStrength}%` : 'цветокор выключен',
+    `экспорт: ${metadataPreset.summary}`,
     ...(recipe.usePresetOverlay ? ['встроенная цветная PNG‑карточка'] : []),
     ...(recipe.overlayPath ? ['свой PNG подключён'] : recipe.usePresetOverlay ? [] : ['PNG не указан']),
     recipe.textVariations.length ? `текст: ${recipe.textVariations.length} фраз` : 'текст не задан',
@@ -401,6 +463,7 @@ function updateCampaignRecipeSummary() {
   const target = $('#campaign-recipe-summary');
   if (!target) return;
   const recipe = campaignRecipePayload();
+  const metadataPreset = currentCampaignMetadataPreset();
   const labels = [];
   if (recipe.usePresetOverlay) labels.push('встроенная цветная PNG‑карточка');
   if (recipe.overlayPath) labels.push(`оверлей · ${recipe.overlayPosition}`);
@@ -412,7 +475,10 @@ function updateCampaignRecipeSummary() {
   if (recipe.audioMode === 'mute') labels.push('без звука');
   else if (recipe.audioPath) labels.push('фоновая дорожка');
   else if (recipe.audioMode === 'normalize') labels.push('громкость нормализуется');
+  labels.push(`экспорт · ${metadataPreset.summary}`);
+  if (recipe.metadataLines.length) labels.push(`подписи · ${recipe.metadataLines.length}`);
   target.innerHTML = labels.map(label => `<span>${escapeHtml(label)}</span>`).join('');
+  renderCampaignMetadataPreset();
   renderCampaignPreset();
 }
 
@@ -542,7 +608,9 @@ function campaignRecipePayload() {
     colorStrength: campaignNumber('#campaign-color-strength', 35),
     audioMode: $('#campaign-audio-mode').value,
     audioPath: $('#campaign-audio-path').value.trim(),
-    metadataMode: $('#campaign-metadata').value,
+    metadataMode: 'clean',
+    metadataPresetId: currentCampaignMetadataPreset().id,
+    metadataLines: campaignMetadataLines(),
     addToLibrary: $('#campaign-add-to-library').checked,
   };
 }
@@ -1388,7 +1456,7 @@ function bindEvents() {
     '#campaign-overlay', '#campaign-use-preset-overlay', '#campaign-overlay-position', '#campaign-overlay-width', '#campaign-text-variations', '#campaign-font-path',
     '#campaign-text-size', '#campaign-text-color-mode', '#campaign-text-outline', '#campaign-layout', '#campaign-crop',
     '#campaign-speed-min', '#campaign-speed-max', '#campaign-fps', '#campaign-bitrate-kbps', '#campaign-color-correction-enabled',
-    '#campaign-audio-mode', '#campaign-audio-path', '#campaign-metadata', '#campaign-add-to-library',
+    '#campaign-audio-mode', '#campaign-audio-path', '#campaign-metadata-preset', '#campaign-metadata-lines', '#campaign-add-to-library',
   ];
   recipeControls.forEach(selector => {
     const control = $(selector);
@@ -1396,6 +1464,7 @@ function bindEvents() {
     control.addEventListener('input', updateCampaignRecipeSummary);
     control.addEventListener('change', updateCampaignRecipeSummary);
   });
+  $('#campaign-metadata-file').onchange = importCampaignMetadataFile;
   $('#campaign-processing-concurrency').onchange = () => syncCampaignProcessingConcurrency();
   $('#campaign-processing-concurrency-copy').onchange = () => syncCampaignProcessingConcurrency('copy');
   syncCampaignProcessingConcurrency();
