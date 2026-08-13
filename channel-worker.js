@@ -906,7 +906,7 @@ export async function updateChannelBranding({
     // Studio does not expose the selected local filename after a reload. For
     // image-only tasks, require an explicit Studio save signal rather than
     // reporting success based only on input.files before Publish.
-    if ((avatarPath || bannerPath) && !saveSignal) {
+    if ((avatarPath || bannerPath) && (!saveSignal || saveSignal === 'publish-control-cleared')) {
       throw new Error('YouTube Studio did not confirm saving the selected channel image. Nothing was marked complete.');
     }
 

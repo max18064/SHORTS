@@ -211,6 +211,7 @@ function assertWorkerSafetyContract(source) {
 
   const saveConfirmation = source.indexOf('saveConfirmed: true', reload);
   assert.ok(saveConfirmation > savedDescriptionVerification, 'A completed branding result must declare independent save confirmation only after reload checks.');
+  assert.match(source, /saveSignal === 'publish-control-cleared'/, 'Image tasks must not treat a disabled Publish control as independent image-save proof.');
 }
 
 async function importFixtureWorker() {
