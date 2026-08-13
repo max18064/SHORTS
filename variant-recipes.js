@@ -432,6 +432,199 @@ export function createEditorialRecipe({ source, campaignId = '', variantIndex = 
   };
 }
 
+// Public preset labels intentionally contain no rendering settings.  The
+// concrete settings are resolved below for a particular output, then saved in
+// its recipe where an operator can inspect them.  A preset is therefore a
+// repeatable editorial starting point, not an opaque "uniqueness" switch.
+export const EDITORIAL_PRESETS = Object.freeze([
+  Object.freeze({
+    id: 'manual',
+    name: 'Ручной режим',
+    description: 'Оставляет выбранные параметры обработки без пресета.',
+  }),
+  Object.freeze({
+    id: 'shorts-balanced',
+    name: 'Shorts — сбалансированный',
+    description: 'Вертикальный 9:16 с умеренными открытыми изменениями темпа, цвета и кодирования.',
+  }),
+  Object.freeze({
+    id: 'soft-editorial',
+    name: 'Мягкий монтаж',
+    description: 'Кадр 4:5 с мягкой цветокоррекцией и спокойным темпом.',
+  }),
+  Object.freeze({
+    id: 'square-stories',
+    name: 'Квадратные истории',
+    description: 'Кадр 1:1 для ленты с явными изменениями темпа, цвета и FPS.',
+  }),
+]);
+
+const EDITORIAL_PRESET_IDS = new Set(EDITORIAL_PRESETS.map(preset => preset.id));
+
+/**
+ * Return lightweight preset information suitable for a selector in the UI.
+ * A fresh object is returned for every item so callers cannot mutate the
+ * exported preset catalogue.
+ */
+export function listEditorialPresets() {
+  return EDITORIAL_PRESETS.map(({ id, name, description }) => ({ id, name, description }));
+}
+
+function normalizePresetId(value) {
+  const presetId = normalizedText(value ?? '', 'presetId', { maxLength: 64 }).toLowerCase();
+  if (!presetId || presetId === 'manual') return 'manual';
+  if (!EDITORIAL_PRESET_IDS.has(presetId)) {
+    throw recipeError('presetId is not supported.', 'editorial-preset-invalid');
+  }
+  return presetId;
+}
+
+function resolvePresetContext({ source, campaignId = '', variantIndex = 1, profileId = 'default' } = {}) {
+  const normalizedSource = normalizeSource(source);
+  const normalizedCampaignId = normalizedText(campaignId, 'campaignId', { maxLength: MAX_ID_LENGTH });
+  const normalizedVariantIndex = normalizedInteger(variantIndex, 'variantIndex', {
+    min: 1,
+    max: MAX_EDITORIAL_CAMPAIGN_OUTPUTS,
+  });
+  const normalizedProfileId = normalizedText(profileId, 'profileId', {
+    required: true,
+    maxLength: MAX_ID_LENGTH,
+  });
+  return {
+    source: normalizedSource,
+    campaignId: normalizedCampaignId,
+    variantIndex: normalizedVariantIndex,
+    profileId: normalizedProfileId,
+    variationSeed: {
+      campaignId: normalizedCampaignId,
+      sourceId: normalizedSource.id,
+      sourcePath: normalizedSource.filePath,
+      variantIndex: normalizedVariantIndex,
+      profileId: normalizedProfileId,
+    },
+  };
+}
+
+function presetSlot(context, presetId, count) {
+  const offset = hashInteger({
+    kind: 'editorial-preset-slot',
+    presetId,
+    campaignId: context.campaignId,
+    sourceId: context.source.id,
+    profileId: context.profileId,
+  }) % count;
+  // 137 is coprime with the 500-output campaign limit, so the first 500
+  // variant indexes visit every available slot exactly once.
+  return ((context.variantIndex - 1) * 137 + offset) % count;
+}
+
+function presetPace(context, presetId, { min, max }) {
+  const slots = MAX_EDITORIAL_CAMPAIGN_OUTPUTS;
+  const slot = presetSlot(context, presetId, slots);
+  return Math.round((min + ((max - min) * (slot / (slots - 1)))) * 10_000) / 10_000;
+}
+
+function presetChoice(context, presetId, name, values) {
+  const offset = hashInteger({
+    kind: 'editorial-preset-choice',
+    presetId,
+    name,
+    campaignId: context.campaignId,
+    sourceId: context.source.id,
+    profileId: context.profileId,
+  }) % values.length;
+  return values[(context.variantIndex - 1 + offset) % values.length];
+}
+
+function presetCoreEdits(context, presetId) {
+  if (presetId === 'shorts-balanced') {
+    const color = presetChoice(context, presetId, 'color', [
+      { level: 'weak', amount: 58 },
+      { level: 'medium', amount: 64 },
+      { level: 'medium', amount: 72 },
+    ]);
+    return {
+      crop: { aspect: '9:16', position: 'center' },
+      scale: { width: 1080, height: 1920, fit: 'cover' },
+      pace: presetPace(context, presetId, { min: 0.955, max: 1.045 }),
+      color,
+      video: {
+        fps: presetChoice(context, presetId, 'fps', [24, 25, 30]),
+        bitrateKbps: presetChoice(context, presetId, 'bitrate', [2600, 3000, 3400, 3800]),
+      },
+    };
+  }
+
+  if (presetId === 'soft-editorial') {
+    const color = presetChoice(context, presetId, 'color', [
+      { level: 'weak', amount: 38 },
+      { level: 'weak', amount: 48 },
+      { level: 'medium', amount: 52 },
+    ]);
+    return {
+      crop: { aspect: '4:5', position: 'center' },
+      scale: { width: 1080, height: 1350, fit: 'cover' },
+      pace: presetPace(context, presetId, { min: 0.965, max: 1.035 }),
+      color,
+      video: {
+        fps: presetChoice(context, presetId, 'fps', [24, 25, 30]),
+        bitrateKbps: presetChoice(context, presetId, 'bitrate', [2400, 2800, 3200]),
+      },
+    };
+  }
+
+  if (presetId === 'square-stories') {
+    const color = presetChoice(context, presetId, 'color', [
+      { level: 'weak', amount: 50 },
+      { level: 'medium', amount: 58 },
+      { level: 'medium', amount: 68 },
+    ]);
+    return {
+      crop: { aspect: '1:1', position: 'center' },
+      scale: { width: 1080, height: 1080, fit: 'cover' },
+      pace: presetPace(context, presetId, { min: 0.96, max: 1.04 }),
+      color,
+      video: {
+        fps: presetChoice(context, presetId, 'fps', [24, 25, 30]),
+        bitrateKbps: presetChoice(context, presetId, 'bitrate', [2200, 2600, 3000, 3400]),
+      },
+    };
+  }
+
+  throw recipeError('presetId is not supported.', 'editorial-preset-invalid');
+}
+
+/**
+ * Resolve a named preset into the explicit edits used by one output recipe.
+ *
+ * `overlay`, `text`, and `audio` always come from `baseEdits`; presets never
+ * invent visual captions, files, audio, metadata, device values, or hidden
+ * content.  The three named presets intentionally own crop/scale/pace/color
+ * and video encoding so every output has an inspectable, deterministic set of
+ * visible editorial settings.  `manual`, an omitted ID, and an empty ID only
+ * validate and normalize `baseEdits` without adding preset changes.
+ */
+export function resolveEditorialPreset({
+  presetId = 'manual',
+  baseEdits = {},
+  source,
+  campaignId = '',
+  variantIndex = 1,
+  profileId = 'default',
+} = {}) {
+  const context = resolvePresetContext({ source, campaignId, variantIndex, profileId });
+  const normalizedPresetId = normalizePresetId(presetId);
+  const rawBaseEdits = baseEdits ?? {};
+  asPlainObject(rawBaseEdits, 'baseEdits');
+  const rawEdits = normalizedPresetId === 'manual'
+    ? rawBaseEdits
+    : { ...rawBaseEdits, ...presetCoreEdits(context, normalizedPresetId) };
+  return normalizeEditorialEdits(rawEdits, {
+    source: context.source,
+    variationSeed: context.variationSeed,
+  });
+}
+
 function normalizeProfile(rawProfile, index) {
   const profile = asPlainObject(rawProfile, `profiles[${index}]`);
   return {

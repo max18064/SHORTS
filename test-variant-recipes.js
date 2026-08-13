@@ -4,6 +4,10 @@ import {
   buildFfmpegArgs,
   createEditorialCampaignPlan,
   createEditorialRecipe,
+  EDITORIAL_PRESETS,
+  listEditorialPresets,
+  normalizeEditorialEdits,
+  resolveEditorialPreset,
   validateEditorialRecipe,
 } from './variant-recipes.js';
 
@@ -180,6 +184,65 @@ assert.throws(
   () => validateEditorialRecipe({ ...first, recipeId: 'edr-tampered' }),
   /recipeId does not match/,
   'worker-side validation must reject changed recipe content',
+);
+
+assert.deepEqual(
+  listEditorialPresets().map(preset => preset.id),
+  ['manual', 'shorts-balanced', 'soft-editorial', 'square-stories'],
+  'the public preset catalogue must expose the supported stable IDs',
+);
+assert.equal(EDITORIAL_PRESETS.length, 4, 'the frozen preset definitions remain available to callers');
+const manualPresetEdits = resolveEditorialPreset({
+  baseEdits: { pace: 1, audio: { mode: 'keep' } },
+  source,
+  campaignId: 'preset-test',
+  variantIndex: 1,
+  profileId: 'local',
+});
+assert.deepEqual(
+  manualPresetEdits,
+  normalizeEditorialEdits({ pace: 1, audio: { mode: 'keep' } }, { source }),
+  'manual preset must not add changes',
+);
+
+const presetVariants = Array.from({ length: 10 }, (_, index) => resolveEditorialPreset({
+  presetId: 'shorts-balanced',
+  baseEdits: {
+    overlay: { filePath: path.join(fixtures, 'title.png'), width: 240 },
+    audio: { mode: 'keep' },
+  },
+  source,
+  campaignId: 'preset-test',
+  variantIndex: index + 1,
+  profileId: 'local',
+}));
+const presetRecipes = presetVariants.map((edits, index) => createEditorialRecipe({
+  source,
+  campaignId: 'preset-test',
+  variantIndex: index + 1,
+  profileId: 'local',
+  edits,
+}));
+assert.ok(presetVariants.every(edits => edits.overlay?.filePath === path.join(fixtures, 'title.png')),
+  'a preset must preserve an explicitly supplied overlay rather than inventing one');
+assert.equal(presetVariants.some(edits => edits.text), false, 'a preset must not add text without caller input');
+assert.equal(new Set(presetVariants.map(edits => edits.pace)).size, 10,
+  'ten preset outputs must use ten explicit pace values rather than duplicate parameters');
+assert.equal(new Set(presetRecipes.map(recipe => recipe.renderSignature)).size, 10,
+  'ten preset outputs must produce distinct transparent render signatures');
+assert.deepEqual(
+  resolveEditorialPreset({
+    presetId: 'soft-editorial', baseEdits: {}, source, campaignId: 'preset-test', variantIndex: 4, profileId: 'local',
+  }),
+  resolveEditorialPreset({
+    presetId: 'soft-editorial', baseEdits: {}, source, campaignId: 'preset-test', variantIndex: 4, profileId: 'local',
+  }),
+  'a preset must resolve deterministically for the same output identity',
+);
+assert.throws(
+  () => resolveEditorialPreset({ presetId: 'unknown', baseEdits: {}, source }),
+  /presetId is not supported/,
+  'unknown preset IDs must be rejected',
 );
 
 const sources = Array.from({ length: 5 }, (_, index) => ({
