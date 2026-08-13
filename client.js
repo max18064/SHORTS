@@ -357,7 +357,8 @@ function renderCampaignPreset() {
     recipe.fps === 'keep' ? 'исходный FPS' : `${recipe.fps} FPS`,
     `${recipe.bitrateKbps} Кбит/с`,
     recipe.colorCorrectionEnabled ? `цветокор ${recipe.colorStrength}%` : 'цветокор выключен',
-    recipe.overlayPath ? 'PNG подключён' : 'PNG не указан',
+    ...(recipe.usePresetOverlay ? ['встроенная цветная PNG‑карточка'] : []),
+    ...(recipe.overlayPath ? ['свой PNG подключён'] : recipe.usePresetOverlay ? [] : ['PNG не указан']),
     recipe.textVariations.length ? `текст: ${recipe.textVariations.length} фраз` : 'текст не задан',
   ];
   copy.innerHTML = `<b>${escapeHtml(preset.title)}</b> — ${escapeHtml(preset.description)}`;
@@ -368,6 +369,8 @@ function applyCampaignPreset(id) {
   const preset = UNIQUEIZER_PRESETS[id] || UNIQUEIZER_PRESETS.manual;
   const select = $('#campaign-preset');
   if (select) select.value = preset.id;
+  const usePresetOverlay = $('#campaign-use-preset-overlay');
+  if (usePresetOverlay) usePresetOverlay.checked = preset.id !== 'manual';
   Object.entries(preset.values).forEach(([key, value]) => {
     const control = $(UNIQUEIZER_PRESET_CONTROL_MAP[key]);
     if (!control) return;
@@ -399,6 +402,7 @@ function updateCampaignRecipeSummary() {
   if (!target) return;
   const recipe = campaignRecipePayload();
   const labels = [];
+  if (recipe.usePresetOverlay) labels.push('встроенная цветная PNG‑карточка');
   if (recipe.overlayPath) labels.push(`оверлей · ${recipe.overlayPosition}`);
   if (recipe.textVariations.length) labels.push(`текст · ${recipe.textVariations.length} вариаций`);
   labels.push(`${recipe.layout === 'keep' ? 'исходный формат' : recipe.layout}`);
@@ -520,6 +524,7 @@ function campaignRecipePayload() {
     speedMin: Number($('#campaign-speed-min').value),
     speedMax: Number($('#campaign-speed-max').value),
     overlayPath: $('#campaign-overlay').value.trim(),
+    usePresetOverlay: Boolean($('#campaign-use-preset-overlay')?.checked),
     overlayOpacity: campaignNumber('#campaign-overlay-opacity', 100) / 100,
     overlayPosition: $('#campaign-overlay-position').value,
     overlayWidth: campaignNumber('#campaign-overlay-width', 240),
@@ -1380,7 +1385,7 @@ function bindEvents() {
     });
   });
   const recipeControls = [
-    '#campaign-overlay', '#campaign-overlay-position', '#campaign-overlay-width', '#campaign-text-variations', '#campaign-font-path',
+    '#campaign-overlay', '#campaign-use-preset-overlay', '#campaign-overlay-position', '#campaign-overlay-width', '#campaign-text-variations', '#campaign-font-path',
     '#campaign-text-size', '#campaign-text-color-mode', '#campaign-text-outline', '#campaign-layout', '#campaign-crop',
     '#campaign-speed-min', '#campaign-speed-max', '#campaign-fps', '#campaign-bitrate-kbps', '#campaign-color-correction-enabled',
     '#campaign-audio-mode', '#campaign-audio-path', '#campaign-metadata', '#campaign-add-to-library',
