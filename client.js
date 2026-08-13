@@ -1,4 +1,8 @@
-const state = { health: null, profiles: [], tasks: [], library: [], channelTasks: [], logs: [], proxies: [], settings: null, worker: null, accountStates: new Map(), analytics: new Map(), studioBatches: [] };
+const state = {
+  health: null, profiles: [], tasks: [], library: [], channelTasks: [], logs: [], proxies: [],
+  settings: null, worker: null, accountStates: new Map(), analytics: new Map(), studioBatches: [], accountBatches: [],
+  bulkProfileIds: new Set(), folders: [],
+};
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
 const pageNames = { overview: 'Главная', profiles: 'Профили Dolphin', accounts: 'Аккаунты YouTube', queue: 'Очередь задач', library: 'Библиотека', channels: 'Каналы', processing: 'Обработка', analytics: 'Аналитика', settings: 'Настройки' };
@@ -37,9 +41,9 @@ function formatDuration(value) {
   const minutes = Math.floor(seconds / 60); const rest = seconds % 60;
   return `${minutes}:${String(rest).padStart(2, '0')}`;
 }
-function statusPill(status) {
+function statusPill(status, label = status) {
   const type = /error|cancelled|manual-login-required|recovery-needed/.test(status) ? 'error' : /queued|starting|uploading|awaiting|scheduled/.test(status) ? 'wait' : '';
-  return `<span class="pill ${type}">${escapeHtml(status)}</span>`;
+  return `<span class="pill ${type}">${escapeHtml(label)}</span>`;
 }
 function setMessage(target, text, type = '') {
   const element = typeof target === 'string' ? $(target) : target;
@@ -50,11 +54,76 @@ function setMessage(target, text, type = '') {
 function profileIdOf(profile) { return String(profile.id || profile.uuid || ''); }
 function profileNameOf(profile) { return profile.name || profile.title || profileIdOf(profile); }
 
+function accountPresentation(profile) {
+  const account = state.accountStates.get(profileIdOf(profile));
+  if (account?.status === 'connected') return { tone: 'ok', label: 'YouTube подключён', badge: 'подключён', account };
+  if (account?.status === 'manual-login-required') return { tone: 'warn', label: 'Нужен ручной вход в YouTube', badge: 'вход нужен', account };
+  if (account?.status === 'error' || account?.error) return { tone: 'bad', label: account.error || 'Ошибка проверки', badge: 'проверить', account };
+  return { tone: 'neutral', label: 'Статус YouTube ещё не проверен', badge: 'не проверен', account };
+}
+
+function profileInitials(profile) {
+  const words = profileNameOf(profile).trim().split(/\s+/).filter(Boolean);
+  return (words.slice(0, 2).map(word => word[0]).join('') || 'P').toUpperCase();
+}
+
+function profileTags(profile) {
+  const values = [profile.platform || profile.browserType, profile.folder?.name || profile.folder]
+    .filter(value => typeof value === 'string' && value.trim())
+    .slice(0, 2);
+  return values.map((value, index) => `<span class="meta-tag ${index === 0 ? 'accent' : ''}">${escapeHtml(value)}</span>`).join('');
+}
+
+function workerSnapshot() {
+  return state.worker || { active: 0, limit: state.settings?.maxConcurrentTasks || 5, lockedProfiles: 0 };
+}
+
+function renderWorkspaceStatus() {
+  let target = $('#overview-workflow');
+  if (!target && $('#connection-notice')) {
+    target = document.createElement('div');
+    target.id = 'overview-workflow';
+    target.className = 'workspace-strip';
+    target.setAttribute('aria-live', 'polite');
+    $('#connection-notice').after(target);
+  }
+  if (!target) return;
+  const worker = workerSnapshot();
+  const checked = [...state.accountStates.values()];
+  const connected = checked.filter(item => item?.status === 'connected').length;
+  const activeTasks = state.tasks.filter(task => !['cancelled', 'awaiting-review', 'error'].includes(task.status)).length;
+  const online = Boolean(state.health?.remoteApi && state.health?.localReachable);
+  const automationConfirmed = Boolean(state.health?.localAuthorized);
+  const steps = [
+    { mark: '01', label: 'Dolphin', value: online ? `${state.profiles.length} профилей` : 'нет связи', tone: !online ? 'is-offline' : automationConfirmed ? '' : 'is-attention' },
+    { mark: '02', label: 'YouTube Studio', value: checked.length ? `${connected}/${checked.length} подключено` : 'ещё не проверено', tone: checked.some(item => item?.status === 'manual-login-required' || item?.status === 'error') ? 'is-attention' : '' },
+    { mark: '03', label: 'Очередь', value: activeTasks ? `${activeTasks} активных задач` : 'задач нет', tone: activeTasks ? '' : '' },
+    { mark: '04', label: 'Потоки', value: `${worker.active || 0} из ${worker.limit || 0} занято`, tone: worker.active ? 'is-attention' : '' },
+  ];
+  target.innerHTML = steps.map(step => `<div class="workspace-step ${step.tone}"><span class="step-mark">${step.mark}</span><span><span class="step-label">${step.label}</span><b>${escapeHtml(step.value)}</b></span></div>`).join('');
+}
+
+function taskStatusLabel(status) {
+  const labels = {
+    queued: 'в очереди', scheduled: 'запланирована', starting: 'подготовка профиля', 'profile-ready': 'готова к загрузке',
+    uploading: 'загрузка в Studio', 'manual-login-required': 'нужен вход', 'login-ready': 'вход подтверждён',
+    'awaiting-review': 'на проверке', completed: 'выполнена', cancelled: 'отменена', error: 'ошибка',
+  };
+  return labels[status] || status || 'неизвестно';
+}
+
+function taskStage(status) {
+  const index = ['queued', 'scheduled'].includes(status) ? 0
+    : ['starting', 'manual-login-required'].includes(status) ? 1
+      : ['profile-ready', 'login-ready', 'uploading'].includes(status) ? 2 : 3;
+  return `<span class="task-stage" aria-label="Этап ${index + 1} из 4">${[0, 1, 2, 3].map(step => `<i class="${step < index ? 'done' : step === index ? 'current' : ''}"></i>`).join('')}</span>`;
+}
+
 function activatePage(id) {
   $$('.nav button').forEach(button => button.classList.toggle('active', button.dataset.page === id));
   $$('.page').forEach(page => page.classList.toggle('active', page.id === id));
   $('#page-title').textContent = pageNames[id] || 'Creator Flow';
-  if (id === 'accounts') renderAccounts();
+  if (id === 'accounts') Promise.all([loadAccounts(), loadAccountBatches()]).catch(() => renderAccounts());
   if (id === 'analytics') Promise.all([refreshAnalyticsView(), loadStudioBatches()]).catch(() => {});
   if (id === 'settings') refreshSettings().catch(() => {});
 }
@@ -79,33 +148,68 @@ function fillLibrarySelect(select, includeBlank = true) {
 async function loadHealth() {
   state.health = await api('/api/health');
   const online = state.health.remoteApi && state.health.localReachable;
-  const localLabel = state.health.localReachable
-    ? 'локальное приложение отвечает'
+  const automationConfirmed = state.health.localAuthorized;
+  const localLabel = automationConfirmed
+    ? 'доступ подтверждён'
+    : state.health.localReachable
+      ? 'приложение найдено; доступ проверяется при операции'
     : 'локальное приложение недоступно';
-  $('#side-status').textContent = online ? 'Dolphin подключён' : 'Проверьте Dolphin';
+  $('#side-status').textContent = online ? (automationConfirmed ? 'Dolphin подключён' : 'Dolphin найден') : 'Проверьте Dolphin';
   const notice = $('#connection-notice');
-  notice.className = `notice ${online ? '' : 'warn'}`;
+  notice.className = `notice ${online && automationConfirmed ? '' : 'warn'}`;
   notice.textContent = online
-    ? 'Creator Flow подключён к локальному Dolphin и его API. Данные страниц загружаются только по вашему действию.'
+    ? automationConfirmed
+      ? 'Creator Flow подключён к Dolphin. Данные страниц загружаются только по вашему действию.'
+      : 'Creator Flow видит Dolphin и его облачный API. Доступ к Automation API будет подтверждён при первой операции с профилем.'
     : `Статус: ${state.health.remoteApi ? 'API Dolphin доступен, но локальное приложение не отвечает.' : 'API Dolphin недоступен. Проверьте ключ и запущенное приложение Dolphin.'}`;
-  $('#settings-health').className = `notice ${online ? '' : 'warn'}`;
-  $('#settings-health').textContent = online ? 'Dolphin API и локальное приложение доступны.' : 'Нет полного подключения к Dolphin.';
+  $('#settings-health').className = `notice ${online && automationConfirmed ? '' : 'warn'}`;
+  $('#settings-health').textContent = online
+    ? automationConfirmed ? 'Dolphin API и Automation API доступны.' : 'Dolphin API доступен; доступ к Automation API будет проверен при запуске профиля.'
+    : 'Нет полного подключения к Dolphin.';
   $('#settings-automation').textContent = localLabel;
+  renderWorkspaceStatus();
 }
 
 async function loadProfiles() {
   const response = await api('/api/profiles');
   state.profiles = response.data || response.profiles || response.items || [];
+  const availableIds = new Set(state.profiles.map(profileIdOf));
+  state.bulkProfileIds = new Set([...state.bulkProfileIds].filter(id => availableIds.has(id)));
   ['#task-profile', '#channel-profile', '#analytics-profile'].forEach(selector => fillProfileSelect($(selector)));
   $('#metric-profiles').textContent = formatNumber(state.profiles.length);
-  renderProfiles(); renderAccounts();
+  renderProfiles(); renderAccounts(); renderBulkProfilePicker(); renderWorkspaceStatus();
+}
+
+async function loadAccounts() {
+  const response = await api('/api/accounts');
+  state.accountStates = new Map((response.accounts || []).map(account => [String(account.profileId), account]));
+  renderProfiles();
+  renderAccounts();
+  renderBulkProfilePicker();
+  renderWorkspaceStatus();
+}
+
+function renderFolderSelect() {
+  const select = $('#profile-create-folder');
+  if (!select) return;
+  const previous = select.value;
+  select.innerHTML = '<option value="">Без папки</option>' + state.folders
+    .map(folder => `<option value="${escapeHtml(folder.id)}">${escapeHtml(`${folder.emoji ? `${folder.emoji} ` : ''}${folder.name}`)}</option>`)
+    .join('');
+  if ([...select.options].some(option => option.value === previous)) select.value = previous;
+}
+
+async function loadFolders() {
+  const response = await api('/api/folders');
+  state.folders = response.data || response.folders || [];
+  renderFolderSelect();
 }
 
 async function loadTasks() {
   const response = await api('/api/tasks');
   state.tasks = response.tasks || [];
   $('#metric-queue').textContent = formatNumber(state.tasks.filter(task => !['cancelled', 'awaiting-review'].includes(task.status)).length);
-  renderTasks(); renderOverviewTasks();
+  renderTasks(); renderOverviewTasks(); renderWorkspaceStatus();
 }
 
 async function loadLibrary() {
@@ -113,7 +217,7 @@ async function loadLibrary() {
   state.library = response.library || [];
   fillLibrarySelect($('#task-library')); fillLibrarySelect($('#render-source'), false);
   $('#metric-library').textContent = formatNumber(state.library.length);
-  renderLibrary();
+  renderLibrary(); renderWorkspaceStatus();
 }
 
 async function loadChannelTasks() {
@@ -155,6 +259,7 @@ function renderWorkerSettings() {
     '#settings-worker',
     `Глобальная очередь: занято ${worker.active} из ${worker.limit} слотов. Параллельно выполняются задачи только на разных профилях; на одном профиле — не более одной операции. Ручных сессий: ${worker.lockedProfiles}.`,
   );
+  renderWorkspaceStatus();
 }
 
 async function loadWorkerSettings() {
@@ -168,44 +273,155 @@ async function refreshAll() {
   $('#refresh-all').disabled = true;
   try {
     await loadHealth();
-    await Promise.all([loadProfiles(), loadTasks(), loadLibrary(), loadChannelTasks(), loadLogs(), loadProxies(), loadFfmpeg(), loadWorkerSettings(), loadStudioBatches()]);
+    await Promise.all([loadProfiles(), loadAccounts(), loadTasks(), loadLibrary(), loadChannelTasks(), loadLogs(), loadProxies(), loadFfmpeg(), loadWorkerSettings(), loadStudioBatches(), loadAccountBatches(), loadFolders()]);
     await refreshAnalyticsView();
   } catch (error) {
     const notice = $('#connection-notice'); notice.className = 'notice error'; notice.textContent = error.message;
   } finally { $('#refresh-all').disabled = false; }
 }
 
+let liveRefreshRunning = false;
+async function refreshLiveState() {
+  if (liveRefreshRunning) return;
+  liveRefreshRunning = true;
+  try {
+    await Promise.all([loadTasks(), loadLogs(), loadWorkerSettings(), loadStudioBatches(), loadAccounts(), loadAccountBatches()]);
+    if ($('#analytics').classList.contains('active')) await refreshAnalyticsView();
+  } catch {
+    // The main refresh action keeps connection errors visible; background refresh stays quiet.
+  } finally {
+    liveRefreshRunning = false;
+  }
+}
+
 function renderProfiles() {
-  const target = $('#profiles-list');
-  if (!state.profiles.length) { target.innerHTML = '<div class="empty">Dolphin не вернул профили. Проверьте API-ключ и подключение.</div>'; return; }
-  target.innerHTML = state.profiles.map(profile => {
-    const id = profileIdOf(profile); const name = profileNameOf(profile);
-    return `<div class="profile-card"><div><b>${escapeHtml(name)}</b><div class="meta">ID: ${escapeHtml(id)} · ${escapeHtml(profile.platform || 'browser profile')}</div></div><div class="profile-actions"><button class="btn" data-profile-start="${escapeHtml(id)}">Запустить</button><button class="btn" data-profile-stop="${escapeHtml(id)}">Остановить</button><button class="btn primary" data-profile-channel="${escapeHtml(id)}">YouTube</button></div></div>`;
-  }).join('');
+  return renderProfileCatalog();
+}
+
+function bindProfileControls(target) {
   target.querySelectorAll('[data-profile-start]').forEach(button => button.onclick = () => controlProfile(button.dataset.profileStart, 'start', button));
   target.querySelectorAll('[data-profile-stop]').forEach(button => button.onclick = () => controlProfile(button.dataset.profileStop, 'stop', button));
-  target.querySelectorAll('[data-profile-channel]').forEach(button => button.onclick = () => { fillProfileSelect($('#channel-profile'), button.dataset.profileChannel); activatePage('channels'); });
+  target.querySelectorAll('[data-profile-channel]').forEach(button => button.onclick = () => {
+    fillProfileSelect($('#channel-profile'), button.dataset.profileChannel);
+    activatePage('channels');
+  });
+}
+
+function renderProfileCatalog() {
+  const target = $('#profiles-list');
+  if (!state.profiles.length) {
+    target.innerHTML = '<div class="empty">Dolphin не вернул профили. Обновите подключение и проверьте API.</div>';
+    return;
+  }
+  const checked = [...state.accountStates.values()];
+  const connected = checked.filter(item => item?.status === 'connected').length;
+  const attention = checked.filter(item => item?.status === 'manual-login-required' || item?.status === 'error').length;
+  let summary = $('#profiles-summary');
+  if (!summary) {
+    summary = document.createElement('div');
+    summary.id = 'profiles-summary';
+    summary.className = 'control-summary';
+    target.before(summary);
+  }
+  summary.innerHTML = `<div class="summary-kpis"><span class="summary-kpi"><b>${state.profiles.length}</b> всего</span><span class="summary-kpi ok"><b>${connected}</b> YouTube подключено</span><span class="summary-kpi ${attention ? 'warn' : ''}"><b>${attention}</b> требуют внимания</span></div><div class="segmented" aria-label="Быстрые действия"><button type="button" data-profiles-refresh>Обновить статусы</button><button type="button" data-profiles-accounts>Открыть аккаунты</button></div>`;
+  summary.querySelector('[data-profiles-refresh]').onclick = () => refreshProfileList();
+  summary.querySelector('[data-profiles-accounts]').onclick = () => activatePage('accounts');
+  target.innerHTML = state.profiles.map(profile => {
+    const id = profileIdOf(profile);
+    const present = accountPresentation(profile);
+    const statusClass = present.tone === 'ok' ? 'ok' : present.tone === 'warn' ? 'warn' : present.tone === 'bad' ? 'bad' : '';
+    const avatarClass = present.tone === 'warn' ? 'warning' : present.tone === 'bad' ? 'error' : '';
+    return `<article class="profile-card"><span class="profile-avatar ${avatarClass}">${escapeHtml(profileInitials(profile))}</span><div class="profile-copy"><div class="profile-heading"><b>${escapeHtml(profileNameOf(profile))}</b>${statusPill(present.account?.status || 'unchecked', present.badge)}</div><div class="profile-meta-grid"><span class="meta-tag">ID ${escapeHtml(id)}</span>${profileTags(profile)}</div><div class="profile-status-line"><i class="status-dot ${statusClass}"></i><span>${escapeHtml(present.label)}</span></div></div><div class="profile-actions"><button class="btn" data-profile-start="${escapeHtml(id)}">Запустить</button><button class="btn" data-profile-stop="${escapeHtml(id)}">Остановить</button><button class="btn primary" data-profile-channel="${escapeHtml(id)}">Канал</button></div></article>`;
+  }).join('');
+  bindProfileControls(target);
 }
 
 function renderAccounts() {
+  return renderAccountCatalog();
+}
+
+function renderAccountCatalog() {
   const target = $('#accounts-list');
   if (!target) return;
   if (!state.profiles.length) {
     target.innerHTML = '<div class="empty">Профили Dolphin не найдены. Сначала обновите подключение к Dolphin.</div>';
     return;
   }
-  target.innerHTML = state.profiles.map(profile => {
+  const records = state.profiles.map(profile => ({ profile, present: accountPresentation(profile) }));
+  const checked = records.filter(({ present }) => present.account).length;
+  const connected = records.filter(({ present }) => present.tone === 'ok').length;
+  const manual = records.filter(({ present }) => present.tone === 'warn').length;
+  let summary = $('#accounts-summary');
+  if (!summary) {
+    summary = document.createElement('div');
+    summary.id = 'accounts-summary';
+    summary.className = 'control-summary';
+    target.before(summary);
+  }
+  summary.innerHTML = `<div class="summary-kpis"><span class="summary-kpi"><b>${checked}/${records.length}</b> проверено</span><span class="summary-kpi ok"><b>${connected}</b> подключено</span><span class="summary-kpi ${manual ? 'warn' : ''}"><b>${manual}</b> нужен вход</span></div><div class="segmented"><button type="button" data-accounts-check-all>Проверить все</button></div>`;
+  summary.querySelector('[data-accounts-check-all]').onclick = () => checkAllAccounts();
+  target.innerHTML = records.map(({ profile, present }) => {
     const id = profileIdOf(profile);
-    const account = state.accountStates.get(id);
-    const status = account?.status === 'connected'
-      ? `Подключён: ${escapeHtml(account.channelName || 'канал прочитан')}`
-      : account?.status === 'manual-login-required'
-        ? 'Требуется ручной вход в YouTube'
-        : account?.error || 'Статус ещё не проверен';
-    const className = account?.status === 'connected' ? 'pill' : account?.status === 'manual-login-required' || account?.error ? 'pill error' : 'pill wait';
-    return `<div class="profile-card"><div><b>${escapeHtml(profileNameOf(profile))}</b><div class="meta">${escapeHtml(status)}</div></div><div class="profile-actions"><span class="${className}">${escapeHtml(account?.status || 'не проверен')}</span><button class="btn primary" data-account-check="${escapeHtml(id)}">Проверить YouTube</button></div></div>`;
+    const analytics = state.analytics.get(id);
+    const channelName = present.account?.channelName || 'Канал будет показан после проверки';
+    const auxiliary = analytics?.syncedAt ? `${analytics.total || 0} роликов в последней синхронизации` : 'Ручной вход и 2FA выполняются только в профиле Dolphin';
+    const avatarClass = present.tone === 'warn' ? 'warning' : present.tone === 'bad' ? 'error' : '';
+    return `<article class="profile-card account-card"><span class="profile-avatar ${avatarClass}">${escapeHtml(profileInitials(profile))}</span><div class="profile-copy"><div class="profile-heading"><b>${escapeHtml(profileNameOf(profile))}</b>${statusPill(present.account?.status || 'unchecked', present.badge)}</div><div class="profile-meta-grid"><span class="meta-tag">Dolphin ${escapeHtml(id)}</span>${profileTags(profile)}</div><div class="profile-status-line"><i class="status-dot ${present.tone === 'ok' ? 'ok' : present.tone === 'warn' ? 'warn' : present.tone === 'bad' ? 'bad' : ''}"></i><span>${escapeHtml(present.label)}</span></div></div><div class="account-signal"><span class="signal-label">YouTube Studio</span><b>${escapeHtml(channelName)}</b><small>${escapeHtml(auxiliary)}</small></div><div class="account-actions"><button class="btn" data-account-channel="${escapeHtml(id)}">Канал</button><button class="btn primary" data-account-check="${escapeHtml(id)}">Проверить</button></div></article>`;
   }).join('');
   target.querySelectorAll('[data-account-check]').forEach(button => button.onclick = () => checkAccount(button.dataset.accountCheck, button));
+  target.querySelectorAll('[data-account-channel]').forEach(button => button.onclick = () => {
+    fillProfileSelect($('#channel-profile'), button.dataset.accountChannel);
+    activatePage('channels');
+  });
+}
+
+function accountBatchSummary(batch) {
+  const items = batch.items || [];
+  const total = Number(batch.total ?? items.length);
+  const completed = Number(batch.completed ?? items.filter(item => item.status === 'completed').length);
+  const failed = Number(batch.failed ?? items.filter(item => item.status === 'error').length);
+  const running = Number(batch.running ?? items.filter(item => item.status === 'running').length);
+  const needsLogin = Number(batch.manualLoginRequired ?? items.filter(item => item.status === 'manual-login-required').length);
+  const queued = Number(batch.queued ?? Math.max(0, total - completed - failed - running - needsLogin));
+  return { total, completed, failed, running, needsLogin, queued };
+}
+
+function renderAccountBatches() {
+  const target = $('#account-batches');
+  if (!target) return;
+  if (!state.accountBatches.length) {
+    target.innerHTML = '<div class="empty">Пакетных проверок пока нет.</div>';
+    return;
+  }
+  target.innerHTML = state.accountBatches.slice(0, 8).map(batch => {
+    const summary = accountBatchSummary(batch);
+    const attention = (batch.items || []).filter(item => ['manual-login-required', 'error'].includes(item.status)).slice(0, 4);
+    const detail = attention.map(item => `${escapeHtml(item.profileId)}: ${item.status === 'manual-login-required' ? 'нужен вход' : 'проверка не выполнена'}`).join('<br>');
+    return `<div class="list-row"><div><b>Проверка ${escapeHtml(String(batch.id).slice(0, 8))}</b><div class="meta">${formatDate(batch.createdAt)} · ${escapeHtml(batch.status || 'queued')}</div>${detail ? `<div class="small error">${detail}</div>` : ''}</div><div class="right"><b>${summary.completed}/${summary.total}</b><div class="small">готово · ${summary.running} в работе · ${summary.queued} в очереди${summary.needsLogin ? ` · ${summary.needsLogin} нужен вход` : ''}${summary.failed ? ` · ${summary.failed} ошибок` : ''}</div></div></div>`;
+  }).join('');
+}
+
+async function loadAccountBatches() {
+  const response = await api('/api/accounts/check-batches');
+  state.accountBatches = response.batches || [];
+  renderAccountBatches();
+}
+
+async function checkAllAccounts() {
+  const button = $('[data-accounts-check-all]');
+  if (button) { button.disabled = true; button.textContent = 'Проверка…'; }
+  try {
+    const response = await api('/api/accounts/check-batches', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profileIds: state.profiles.map(profileIdOf) }),
+    });
+    await Promise.all([loadAccountBatches(), loadLogs(), loadWorkerSettings()]);
+    setMessage('#accounts-message', `Проверка поставлена в очередь: ${response.batch?.total || state.profiles.length} профилей.`);
+  } catch (error) {
+    setMessage('#accounts-message', error.message, 'error');
+  } finally {
+    renderAccountCatalog();
+  }
 }
 
 async function checkAccount(id, button) {
@@ -220,6 +436,7 @@ async function checkAccount(id, button) {
     state.accountStates.set(id, { status: 'error', error: error.message });
   } finally {
     renderAccounts();
+    renderWorkspaceStatus();
     const replacement = $('#accounts-list').querySelector(`[data-account-check="${CSS.escape(id)}"]`);
     if (replacement) { replacement.disabled = false; replacement.textContent = oldText; }
   }
@@ -233,6 +450,10 @@ async function controlProfile(id, action, button) {
 }
 
 function renderTask(task) {
+  return renderTaskCard(task);
+}
+
+function renderTaskCard(task) {
   const actions = [];
   if (task.status === 'queued') actions.push(`<button class="btn" data-task-action="run" data-task-id="${escapeHtml(task.id)}">Запустить</button>`);
   if (task.status === 'profile-ready') actions.push(`<button class="btn primary" data-task-action="upload" data-task-id="${escapeHtml(task.id)}">Загрузить</button>`);
@@ -242,8 +463,130 @@ function renderTask(task) {
       : `<button class="btn warning" data-task-action="prepare-login" data-task-id="${escapeHtml(task.id)}">Открыть вход</button>`);
   }
   if (task.status === 'login-ready') actions.push(`<button class="btn primary" data-task-action="continue-upload" data-task-id="${escapeHtml(task.id)}">Продолжить</button>`);
-  if (!['cancelled', 'awaiting-review', 'error'].includes(task.status)) actions.push(`<button class="btn danger" data-task-action="cancel" data-task-id="${escapeHtml(task.id)}">Отменить</button>`);
-  return `<div class="task"><span class="number">▸</span><span><b>${escapeHtml(task.title)}</b><br><small>${escapeHtml(task.profileId)} · ${task.scheduledAt ? `запуск ${formatDate(task.scheduledAt)}` : 'ручной запуск'}${task.message ? ` · ${escapeHtml(task.message)}` : ''}</small></span><div>${statusPill(task.status)}<div class="profile-actions" style="margin-top:7px">${actions.join('')}</div></div></div>`;
+  if (!['cancelled', 'awaiting-review', 'error', 'completed'].includes(task.status)) actions.push(`<button class="btn danger" data-task-action="cancel" data-task-id="${escapeHtml(task.id)}">Отменить</button>`);
+  const profile = state.profiles.find(item => profileIdOf(item) === String(task.profileId));
+  const profileName = profile ? profileNameOf(profile) : task.profileId;
+  const timing = task.scheduledAt ? `запуск ${formatDate(task.scheduledAt)}` : 'ручной запуск';
+  return `<article class="task"><span class="number">▶</span><div class="task-copy"><div class="task-title-row"><b>${escapeHtml(task.title)}</b>${statusPill(task.status, taskStatusLabel(task.status))}</div><small>${escapeHtml(profileName)} · ${timing}${task.message ? ` · ${escapeHtml(task.message)}` : ''}</small>${taskStage(task.status)}</div><div class="task-side"><span class="meta-tag accent">${escapeHtml(profileName)}</span><div class="profile-actions">${actions.join('')}</div></div></article>`;
+}
+
+function renderBulkProfilePicker() {
+  const target = $('#bulk-profile-picker');
+  const counter = $('#bulk-profile-count');
+  if (!target || !counter) return;
+  const selected = state.bulkProfileIds;
+  const ids = state.profiles.map(profileIdOf);
+  counter.textContent = `Выбрано: ${selected.size} из ${ids.length}`;
+  if (!ids.length) {
+    target.innerHTML = '<div class="empty">Сначала подключите хотя бы один профиль Dolphin.</div>';
+    return;
+  }
+  target.innerHTML = state.profiles.map(profile => {
+    const id = profileIdOf(profile);
+    const present = accountPresentation(profile);
+    return `<label class="bulk-profile-option"><input type="checkbox" value="${escapeHtml(id)}" ${selected.has(id) ? 'checked' : ''}><span class="profile-avatar ${present.tone === 'warn' ? 'warning' : present.tone === 'bad' ? 'error' : ''}">${escapeHtml(profileInitials(profile))}</span><span class="bulk-profile-copy"><b>${escapeHtml(profileNameOf(profile))}</b><small>${escapeHtml(present.label)}</small></span></label>`;
+  }).join('');
+  target.querySelectorAll('input[type="checkbox"]').forEach(input => {
+    input.onchange = () => {
+      if (input.checked) state.bulkProfileIds.add(input.value);
+      else state.bulkProfileIds.delete(input.value);
+      counter.textContent = `Выбрано: ${state.bulkProfileIds.size} из ${ids.length}`;
+    };
+  });
+}
+
+function setAllBulkProfiles(selected) {
+  state.bulkProfileIds = selected ? new Set(state.profiles.map(profileIdOf)) : new Set();
+  renderBulkProfilePicker();
+}
+
+async function createBulkQueue(event) {
+  event.preventDefault();
+  if (!state.bulkProfileIds.size) return setMessage('#bulk-form-message', 'Выберите хотя бы один профиль Dolphin.', 'error');
+  const scheduledValue = $('#bulk-scheduled').value;
+  const body = {
+    profileIds: [...state.bulkProfileIds],
+    videoPath: $('#bulk-video-path').value.trim(),
+    titleTemplate: $('#bulk-title-template').value.trim(),
+    description: $('#bulk-description').value.trim(),
+    tags: $('#bulk-tags').value.split(',').map(tag => tag.trim()).filter(Boolean),
+    scheduledAt: scheduledValue ? new Date(scheduledValue).toISOString() : null,
+    autoUpload: $('#bulk-auto-upload').checked,
+  };
+  const submit = $('#bulk-submit');
+  submit.disabled = true;
+  submit.textContent = 'Добавление…';
+  try {
+    const response = await api('/api/tasks/bulk', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    setMessage('#bulk-form-message', response.autoUpload
+      ? `Пакет создан: ${response.created} задач. Автозапуск включён и будет идти по лимиту потоков.`
+      : `Пакет создан: ${response.created} задач. Они добавлены в очередь без автоматического запуска.`);
+    $('#bulk-form').reset();
+    state.bulkProfileIds = new Set();
+    renderBulkProfilePicker();
+    await Promise.all([loadTasks(), loadLogs()]);
+  } catch (error) {
+    setMessage('#bulk-form-message', error.message, 'error');
+  } finally {
+    submit.disabled = false;
+    submit.textContent = 'Добавить пакет в очередь';
+  }
+}
+
+async function createDolphinProfile(event) {
+  event.preventDefault();
+  const button = $('#profile-create-submit');
+  const body = {
+    name: $('#profile-create-name').value.trim(),
+    platform: $('#profile-create-platform').value,
+    platformVersion: $('#profile-create-platform-version').value.trim(),
+    browserVersion: Number($('#profile-create-browser-version').value),
+    folderId: $('#profile-create-folder').value || null,
+    tags: $('#profile-create-tags').value.split(',').map(tag => tag.trim()).filter(Boolean),
+  };
+  button.disabled = true;
+  button.textContent = 'Создание…';
+  try {
+    const response = await api('/api/profiles/create', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    setMessage('#profile-create-message', `Профиль «${response.profile?.name || body.name}» создан в Dolphin.`);
+    $('#profile-create-form').reset();
+    $('#profile-create-platform').value = 'windows';
+    $('#profile-create-platform-version').value = '10.0.0';
+    $('#profile-create-browser-version').value = '136';
+    await Promise.all([loadProfiles(), loadFolders(), loadLogs()]);
+  } catch (error) {
+    setMessage('#profile-create-message', error.message, 'error');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Создать профиль';
+  }
+}
+
+async function createDolphinFolder(event) {
+  event.preventDefault();
+  const name = $('#folder-create-name').value.trim();
+  const button = $('#folder-create-submit');
+  if (!name) return setMessage('#folder-create-message', 'Укажите название папки.', 'error');
+  button.disabled = true;
+  button.textContent = '…';
+  try {
+    const response = await api('/api/folders', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+    });
+    $('#folder-create-name').value = '';
+    setMessage('#folder-create-message', `Папка «${response.folder?.name || name}» создана.`);
+    await Promise.all([loadFolders(), loadLogs()]);
+    if (response.folder?.id !== undefined) $('#profile-create-folder').value = String(response.folder.id);
+  } catch (error) {
+    setMessage('#folder-create-message', error.message, 'error');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Создать';
+  }
 }
 
 function renderTasks() {
@@ -339,8 +682,9 @@ function batchSummary(batch) {
   const completed = Number(batch.completed ?? items.filter(item => item.status === 'completed').length);
   const failed = Number(batch.failed ?? items.filter(item => item.status === 'error').length);
   const running = Number(batch.running ?? items.filter(item => item.status === 'running').length);
-  const queued = Number(batch.queued ?? Math.max(0, total - completed - failed - running));
-  return { total, completed, failed, running, queued };
+  const needsLogin = Number(batch.manualLoginRequired ?? items.filter(item => item.status === 'manual-login-required').length);
+  const queued = Number(batch.queued ?? Math.max(0, total - completed - failed - running - needsLogin));
+  return { total, completed, failed, running, needsLogin, queued };
 }
 
 function renderStudioBatches() {
@@ -352,9 +696,9 @@ function renderStudioBatches() {
   }
   target.innerHTML = state.studioBatches.slice(0, 8).map(batch => {
     const summary = batchSummary(batch);
-    const details = (batch.items || []).filter(item => item.status === 'error').slice(0, 3)
-      .map(item => `${escapeHtml(item.profileId)}: ${escapeHtml(item.error || 'ошибка')}`).join('<br>');
-    return `<div class="list-row"><div><b>Пакет ${escapeHtml(String(batch.id).slice(0, 8))}</b><div class="meta">${formatDate(batch.createdAt)} · ${escapeHtml(batch.status || 'queued')}</div>${details ? `<div class="small error">${details}</div>` : ''}</div><div class="right"><b>${summary.completed}/${summary.total}</b><div class="small">готово · ${summary.running} в работе · ${summary.queued} в очереди${summary.failed ? ` · ${summary.failed} ошибок` : ''}</div></div></div>`;
+    const details = (batch.items || []).filter(item => ['error', 'manual-login-required'].includes(item.status)).slice(0, 3)
+      .map(item => `${escapeHtml(item.profileId)}: ${item.status === 'manual-login-required' ? 'нужен вход' : escapeHtml(item.error || 'ошибка')}`).join('<br>');
+    return `<div class="list-row"><div><b>Пакет ${escapeHtml(String(batch.id).slice(0, 8))}</b><div class="meta">${formatDate(batch.createdAt)} · ${escapeHtml(batch.status || 'queued')}</div>${details ? `<div class="small error">${details}</div>` : ''}</div><div class="right"><b>${summary.completed}/${summary.total}</b><div class="small">готово · ${summary.running} в работе · ${summary.queued} в очереди${summary.needsLogin ? ` · ${summary.needsLogin} нужен вход` : ''}${summary.failed ? ` · ${summary.failed} ошибок` : ''}</div></div></div>`;
   }).join('');
 }
 
@@ -410,8 +754,10 @@ function bindEvents() {
   $$('.nav button').forEach(button => button.onclick = () => activatePage(button.dataset.page));
   $('#refresh-all').onclick = refreshAll;
   $('#go-queue').onclick = () => activatePage('queue');
-  $('#profiles-refresh').onclick = () => loadProfiles().catch(error => alert(error.message));
-  $('#accounts-refresh').onclick = () => loadProfiles().catch(error => alert(error.message));
+  $('#profiles-refresh').onclick = () => refreshProfileList();
+  $('#accounts-refresh').onclick = () => refreshAccountList();
+  $('#profile-create-form').onsubmit = createDolphinProfile;
+  $('#folder-create-form').onsubmit = createDolphinFolder;
   $('#task-library').onchange = event => {
     const selected = state.library.find(item => item.filePath === event.target.value);
     if (!selected) return;
@@ -425,6 +771,9 @@ function bindEvents() {
     try { await api('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); event.target.reset(); fillProfileSelect($('#task-profile')); fillLibrarySelect($('#task-library')); setMessage('#task-form-message', 'Задача добавлена в очередь.'); await Promise.all([loadTasks(), loadLogs()]); }
     catch (error) { setMessage('#task-form-message', error.message, 'error'); }
   };
+  $('#bulk-form').onsubmit = createBulkQueue;
+  $('#bulk-select-all').onclick = () => setAllBulkProfiles(true);
+  $('#bulk-select-none').onclick = () => setAllBulkProfiles(false);
   $('#library-upload').onclick = uploadLibraryFiles;
   $('#library-import-path').onclick = importLibraryPath;
   $('#channel-read').onclick = () => readChannel(false);
@@ -435,6 +784,24 @@ function bindEvents() {
   $('#analytics-sync-all').onclick = syncAllAnalytics;
   $('#proxy-import').onclick = importProxies;
   $('#settings-save-concurrency').onclick = saveWorkerSettings;
+}
+
+async function refreshProfileList() {
+  try {
+    await Promise.all([loadProfiles(), loadFolders()]);
+    setMessage('#profiles-message', 'Список профилей обновлён.');
+  } catch (error) {
+    setMessage('#profiles-message', error.message, 'error');
+  }
+}
+
+async function refreshAccountList() {
+  try {
+    await Promise.all([loadProfiles(), loadAccounts(), loadAccountBatches()]);
+    setMessage('#accounts-message', 'Список аккаунтов обновлён.');
+  } catch (error) {
+    setMessage('#accounts-message', error.message, 'error');
+  }
 }
 
 async function saveWorkerSettings() {
@@ -533,5 +900,5 @@ async function importProxies() {
 document.addEventListener('DOMContentLoaded', async () => {
   bindEvents();
   await refreshAll();
-  setInterval(() => loadLogs().catch(() => {}), 12_000);
+  setInterval(() => refreshLiveState(), 8_000);
 });

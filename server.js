@@ -26,6 +26,12 @@ const channelTasks = [];
 const library = [];
 const studioCache = {};
 const studioSyncBatches = [];
+// Account status is intentionally a small, read-only cache.  It never keeps
+// browser cookies, credentials, avatar URLs, or any of the raw Studio page.
+// The profile id is the object key; every persisted value is normalized by
+// `sanitizeAccountStatus` below.
+const accountStatusCache = Object.create(null);
+const accountCheckBatches = [];
 const automationSessions = {};
 const settings = { maxConcurrentTasks: 5 };
 const logs = [];
@@ -36,6 +42,7 @@ const activeOperations = new Map();
 const lockedManualProfiles = new Map();
 let schedulerRunning = false;
 let studioBatchPumpRunning = false;
+let accountCheckBatchPumpRunning = false;
 const execFileAsync = promisify(execFile);
 const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
 const ffprobeBin = process.env.FFPROBE_PATH || (path.basename(ffmpegBin).toLowerCase().startsWith('ffmpeg') ? path.join(path.dirname(ffmpegBin), process.platform === 'win32' ? 'ffprobe.exe' : 'ffprobe') : 'ffprobe');
@@ -63,6 +70,13 @@ if (fs.existsSync(statePath)) {
     library.push(...(saved.library || []));
     Object.assign(studioCache, saved.studioCache || {});
     studioSyncBatches.push(...(saved.studioSyncBatches || []));
+    const persistedAccounts = isObjectRecord(saved.accountStatusCache) ? saved.accountStatusCache : {};
+    for (const [rawProfileId, rawAccount] of Object.entries(persistedAccounts)) {
+      const profileId = String(rawProfileId || '').trim();
+      if (!profileId) continue;
+      accountStatusCache[profileId] = sanitizeAccountStatus(rawAccount, rawAccount?.checkedAt);
+    }
+    accountCheckBatches.push(...(Array.isArray(saved.accountCheckBatches) ? saved.accountCheckBatches.filter(isObjectRecord) : []));
     Object.assign(automationSessions, saved.automationSessions || {});
     if (saved.settings && Number.isFinite(Number(saved.settings.maxConcurrentTasks))) {
       settings.maxConcurrentTasks = Math.min(Math.max(Math.round(Number(saved.settings.maxConcurrentTasks)), 1), 20);
@@ -98,11 +112,34 @@ for (const batch of studioSyncBatches) {
     }
   }
 }
+for (const batch of accountCheckBatches) {
+  if (!Array.isArray(batch.items)) {
+    batch.items = [];
+    stateNeedsCleanup = true;
+  } else {
+    const validItems = batch.items.filter(isObjectRecord);
+    if (validItems.length !== batch.items.length) {
+      batch.items = validItems;
+      stateNeedsCleanup = true;
+    }
+  }
+  for (const item of batch.items || []) {
+    if (item.status === 'running') {
+      item.status = 'queued';
+      item.message = 'Проверка будет продолжена после перезапуска локальной панели.';
+      item.updatedAt = new Date().toISOString();
+      stateNeedsCleanup = true;
+    }
+  }
+  const previousStatus = batch.status;
+  refreshAccountCheckBatchStatus(batch);
+  if (batch.status !== previousStatus) stateNeedsCleanup = true;
+}
 function saveState() {
   if (stateLoadError) {
     throw new Error('Локальное состояние не прочитано; исходный файл сохранён как резервная копия. Восстановите его перед изменением данных.');
   }
-  const payload = JSON.stringify({ tasks, proxies, videos, channelTasks, library, studioCache, studioSyncBatches, automationSessions, settings }, null, 2);
+  const payload = JSON.stringify({ tasks, proxies, videos, channelTasks, library, studioCache, studioSyncBatches, accountStatusCache, accountCheckBatches, automationSessions, settings }, null, 2);
   const tempPath = `${statePath}.${process.pid}.${Date.now()}.tmp`;
   try {
     fs.writeFileSync(tempPath, payload);
@@ -130,9 +167,132 @@ function publicProfile(profile) {
     platform: profile?.platform ?? profile?.platformName ?? '',
     browserType: profile?.browserType ?? '',
     folder: typeof profile?.folder === 'string' ? profile.folder : profile?.folder?.name ?? '',
+    folderId: profile?.folderId ?? profile?.folder_id ?? profile?.folder?.id ?? null,
     tags: Array.isArray(profile?.tags) ? profile.tags.map(tag => typeof tag === 'string' ? tag : tag?.name).filter(Boolean) : [],
     lastStartTime: profile?.lastStartTime ?? null,
   };
+}
+function cleanAccountText(value, maxLength) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+function cleanAccountUrl(value) {
+  const raw = cleanAccountText(value, 2_000);
+  if (!raw) return '';
+  try {
+    const url = new URL(raw);
+    if (!['http:', 'https:'].includes(url.protocol)) return '';
+    // Studio URLs do not need URL fragments, credentials, or query parameters
+    // for account identification. Dropping them keeps the cache non-sensitive.
+    url.username = '';
+    url.password = '';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return '';
+  }
+}
+function cleanCheckedAt(value) {
+  const parsed = typeof value === 'string' ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : new Date().toISOString();
+}
+function sanitizeAccountStatus(channel, checkedAt = new Date().toISOString()) {
+  return {
+    status: cleanAccountText(channel?.status, 64) || 'unknown',
+    channelName: cleanAccountText(channel?.channelName, 200),
+    url: cleanAccountUrl(channel?.url),
+    checkedAt: cleanCheckedAt(checkedAt),
+  };
+}
+function cacheAccountStatus(profileId, channel) {
+  const id = String(profileId || '').trim();
+  if (!id) return null;
+  const account = sanitizeAccountStatus(channel);
+  accountStatusCache[id] = account;
+  saveState();
+  return account;
+}
+function publicAccount(profileId, account) {
+  return { profileId: String(profileId), ...sanitizeAccountStatus(account, account?.checkedAt) };
+}
+function publicFolder(folder) {
+  const profiles = Array.isArray(folder?.browserProfilesData) ? folder.browserProfilesData : [];
+  return {
+    id: folder?.id ?? '',
+    name: folder?.name ?? '',
+    emoji: folder?.emoji ?? '',
+    isPinned: Boolean(folder?.isPinned ?? folder?.pinned),
+    profileCount: Number(folder?.profileCount ?? folder?.profilesCount ?? profiles.length ?? 0),
+  };
+}
+function isObjectRecord(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+function dolphinEntity(result) {
+  return isObjectRecord(result?.data) ? result.data : isObjectRecord(result) ? result : {};
+}
+function responseRows(result) {
+  if (Array.isArray(result?.data)) return result.data;
+  return Array.isArray(result) ? result : [];
+}
+function validationError(message) {
+  const error = new Error(message);
+  error.statusCode = 400;
+  return error;
+}
+function cleanRequiredString(value, label, maxLength) {
+  if (typeof value !== 'string') throw validationError(`${label} обязателен.`);
+  const cleaned = value.trim();
+  if (!cleaned) throw validationError(`${label} обязателен.`);
+  if (cleaned.length > maxLength) throw validationError(`${label} не должен быть длиннее ${maxLength} символов.`);
+  if (/[\u0000-\u001f\u007f]/.test(cleaned)) throw validationError(`${label} содержит недопустимые символы.`);
+  return cleaned;
+}
+function normalizeFolderInput(body) {
+  const name = cleanRequiredString(body?.name, 'Название папки', 50);
+  let emoji = '';
+  if (body?.emoji !== undefined && body?.emoji !== null && body?.emoji !== '') {
+    if (typeof body.emoji !== 'string') throw validationError('Значок папки должен быть строкой.');
+    emoji = body.emoji.trim();
+    if (emoji.length > 32 || /[\u0000-\u001f\u007f]/.test(emoji)) throw validationError('Значок папки содержит недопустимые символы.');
+  }
+  const isPinnedSource = body?.isPinned ?? body?.pinned ?? false;
+  if (typeof isPinnedSource !== 'boolean') throw validationError('Параметр закрепления папки должен быть логическим значением.');
+  return { name, ...(emoji ? { emoji } : {}), isPinned: isPinnedSource };
+}
+function normalizeProfileCreationInput(body) {
+  const name = cleanRequiredString(body?.name, 'Название профиля', 255);
+  const platform = typeof body?.platform === 'string' ? body.platform.trim().toLowerCase() : '';
+  if (!['windows', 'linux', 'macos'].includes(platform)) throw validationError('Платформа профиля: windows, linux или macos.');
+  const platformVersion = cleanRequiredString(body?.platformVersion, 'Версия платформы', 64);
+  const browserVersion = Number(body?.browserVersion);
+  if (!Number.isInteger(browserVersion) || browserVersion < 1 || browserVersion > 999) throw validationError('Версия браузера должна быть целым числом от 1 до 999.');
+  let folderId = null;
+  if (body?.folderId !== undefined && body?.folderId !== null && String(body.folderId).trim() !== '') {
+    folderId = Number(body.folderId);
+    if (!Number.isSafeInteger(folderId) || folderId < 1) throw validationError('Идентификатор папки должен быть положительным целым числом.');
+  }
+  const rawTags = body?.tags === undefined || body?.tags === null ? [] : body.tags;
+  if (!Array.isArray(rawTags)) throw validationError('Метки профиля должны быть списком.');
+  if (rawTags.length > 30) throw validationError('Для профиля доступно не более 30 меток.');
+  const tagKeys = new Set();
+  const tags = rawTags.map(tag => {
+    if (typeof tag !== 'string') throw validationError('Каждая метка профиля должна быть строкой.');
+    const cleaned = tag.trim();
+    if (!cleaned || cleaned.length > 64 || /[\u0000-\u001f\u007f]/.test(cleaned)) throw validationError('Метка профиля должна содержать от 1 до 64 допустимых символов.');
+    return cleaned;
+  }).filter(tag => {
+    const key = tag.toLocaleLowerCase();
+    if (tagKeys.has(key)) return false;
+    tagKeys.add(key);
+    return true;
+  });
+  return { name, platform, platformVersion, browserVersion, folderId, tags };
+}
+function fingerprintFromResponse(result) {
+  if (isObjectRecord(result?.data)) return result.data;
+  return isObjectRecord(result) ? result : {};
 }
 function publicTask(task) {
   const { wsEndpoint, profileResult, ...safe } = task;
@@ -284,6 +444,49 @@ function safeFileName(value) {
   const normalized = base.replace(/[^\p{L}\p{N}._ -]/gu, '_').replace(/^\.+/, '');
   return normalized || 'video.mp4';
 }
+const MAX_BULK_UPLOAD_TASKS = 100;
+function normalizeBulkProfileIds(rawIds) {
+  if (!Array.isArray(rawIds)) return { error: 'profileIds must be an array.' };
+  const invalid = [];
+  const profileIds = [];
+  const seen = new Set();
+  rawIds.forEach((value, index) => {
+    if (typeof value !== 'string' && typeof value !== 'number') {
+      invalid.push(index + 1);
+      return;
+    }
+    const profileId = String(value).trim();
+    if (!profileId || profileId.length > 128 || /[\u0000-\u001f\u007f\s]/.test(profileId)) {
+      invalid.push(index + 1);
+      return;
+    }
+    if (!seen.has(profileId)) {
+      seen.add(profileId);
+      profileIds.push(profileId);
+    }
+  });
+  if (invalid.length) return { error: `profileIds contains invalid values at positions: ${invalid.join(', ')}.` };
+  if (!profileIds.length) return { error: 'Choose at least one Dolphin profile.' };
+  if (profileIds.length > MAX_BULK_UPLOAD_TASKS) return { error: `A bulk queue can contain at most ${MAX_BULK_UPLOAD_TASKS} profiles.` };
+  return { profileIds };
+}
+function validateBulkVideoPath(value) {
+  if (typeof value !== 'string') return { error: 'videoPath must be a file path.' };
+  const rawPath = value.trim();
+  if (!rawPath || rawPath.includes('\0')) return { error: 'videoPath must be a non-empty file path.' };
+  const videoPath = path.resolve(rawPath);
+  try {
+    if (!fs.statSync(videoPath).isFile()) return { error: 'videoPath must point to an existing file.' };
+  } catch {
+    return { error: 'videoPath must point to an existing file.' };
+  }
+  return { videoPath };
+}
+function fillBulkTitleTemplate(titleTemplate, profileId, index) {
+  return titleTemplate
+    .replaceAll('{index}', String(index))
+    .replaceAll('{profileId}', profileId);
+}
 function workerState() {
   const occupiedProfiles = workerOccupiedProfiles();
   return {
@@ -373,6 +576,7 @@ function queueProfileOperation({ key, profileId, work, allowManualSessionTaskId 
         queueMicrotask(() => {
           processScheduledTasks().catch(error => addLog(`Ошибка планировщика: ${error.message}`, null, 'error'));
           processStudioSyncBatches().catch(error => addLog(`Ошибка очереди пакетной синхронизации: ${error.message}`, null, 'error'));
+          processAccountCheckBatches().catch(error => addLog(`Ошибка очереди проверки аккаунтов: ${error.message}`, null, 'error'));
         });
       }
     }
@@ -446,6 +650,7 @@ const scheduler = setInterval(() => {
   if (!backgroundEnabled) return;
   processScheduledTasks().catch(error => addLog(`Ошибка планировщика: ${error.message}`, null, 'error'));
   processStudioSyncBatches().catch(error => addLog(`Ошибка очереди пакетной синхронизации: ${error.message}`, null, 'error'));
+  processAccountCheckBatches().catch(error => addLog(`Ошибка очереди проверки аккаунтов: ${error.message}`, null, 'error'));
 }, 5000);
 scheduler.unref();
 const manualSessionJanitor = setInterval(() => { expireManualSessions().catch(error => addLog(`Ошибка очистки ручных сессий: ${error.message}`, null, 'error')); }, 60_000);
@@ -488,8 +693,78 @@ app.get('/api/health', async (_req, res) => {
 app.get('/api/profiles', async (_req, res) => {
   try {
     const result = await dolphinClient.listProfiles();
-    const rows = Array.isArray(result?.data) ? result.data : Array.isArray(result) ? result : [];
+    const rows = responseRows(result);
     res.json({ data: rows.map(publicProfile), total: Number(result?.total ?? result?.meta?.total ?? rows.length) });
+  } catch (error) { res.status(502).json({ error: error.message }); }
+});
+
+app.get('/api/folders', async (_req, res) => {
+  try {
+    const result = await dolphinClient.listFolders();
+    const rows = responseRows(result);
+    res.json({ data: rows.map(publicFolder), total: Number(result?.total ?? result?.meta?.total ?? rows.length) });
+  } catch (error) { res.status(502).json({ error: error.message }); }
+});
+
+app.post('/api/folders', async (req, res) => {
+  let payload;
+  try {
+    payload = normalizeFolderInput(req.body);
+  } catch (error) {
+    return res.status(error.statusCode || 400).json({ error: error.message });
+  }
+  try {
+    const result = await dolphinClient.createFolder(payload);
+    const folder = publicFolder({ ...payload, ...dolphinEntity(result) });
+    addLog(`Создана папка Dolphin: ${folder.name}`);
+    res.status(201).json({ folder });
+  } catch (error) { res.status(502).json({ error: error.message }); }
+});
+
+app.post('/api/profiles/create', async (req, res) => {
+  let input;
+  try {
+    input = normalizeProfileCreationInput(req.body);
+  } catch (error) {
+    return res.status(error.statusCode || 400).json({ error: error.message });
+  }
+  try {
+    // The fingerprint is fetched immediately before creation and passed through unchanged.
+    const fingerprintResponse = await dolphinClient.fingerprint({
+      platform: input.platform,
+      browserType: 'anty',
+      browserVersion: input.browserVersion,
+    });
+    const fingerprint = fingerprintFromResponse(fingerprintResponse);
+    if (!Object.keys(fingerprint).length) {
+      return res.status(422).json({ error: 'Dolphin API не вернул подходящий отпечаток для выбранной платформы и версии браузера.' });
+    }
+    const payload = {
+      name: input.name,
+      platform: input.platform,
+      browserType: 'anty',
+      platformVersion: input.platformVersion,
+      tags: input.tags,
+      fingerprint,
+      ...(input.folderId === null ? {} : { folderId: input.folderId }),
+    };
+    const result = await dolphinClient.createProfile(payload);
+    const created = dolphinEntity(result);
+    const id = created.id ?? result?.browserProfileId ?? result?.id;
+    if (id === undefined || id === null || String(id).trim() === '') {
+      throw new Error('Dolphin API не вернул идентификатор созданного профиля.');
+    }
+    const profile = publicProfile({
+      ...created,
+      id,
+      name: created.name ?? payload.name,
+      platform: created.platform ?? payload.platform,
+      browserType: created.browserType ?? payload.browserType,
+      folderId: created.folderId ?? payload.folderId ?? null,
+      tags: Array.isArray(created.tags) ? created.tags : payload.tags,
+    });
+    addLog(`Создан профиль Dolphin: ${profile.name}`);
+    res.status(201).json({ profile, browserVersion: input.browserVersion });
   } catch (error) { res.status(502).json({ error: error.message }); }
 });
 
@@ -526,7 +801,8 @@ app.post('/api/profiles/:id/stop', async (req, res) => {
 async function readProfileChannel(profileId, restart = false) {
   const profileResult = await startDolphinForAutomation(profileId, restart);
   const wsEndpoint = getAutomationEndpoint(profileResult);
-  const channel = wsEndpoint ? await inspectChannel({ wsEndpoint }) : { status: 'automation-unavailable' };
+  const inspected = wsEndpoint ? await inspectChannel({ wsEndpoint }) : { status: 'automation-unavailable' };
+  const channel = cacheAccountStatus(profileId, inspected);
   addLog(`Проверка YouTube-профиля ${profileId}: ${channel.status}`);
   return { profileId, channel };
 }
@@ -662,6 +938,146 @@ async function processStudioSyncBatches() {
   }
 }
 
+const MAX_ACCOUNT_CHECK_BATCH_SIZE = 100;
+function normalizeAccountCheckProfileIds(rawIds) {
+  if (!Array.isArray(rawIds)) return { error: 'profileIds должен быть массивом.' };
+  if (rawIds.length > MAX_ACCOUNT_CHECK_BATCH_SIZE) return { error: `За одну проверку можно передать не более ${MAX_ACCOUNT_CHECK_BATCH_SIZE} профилей.` };
+  const profileIds = [];
+  const seen = new Set();
+  const invalidPositions = [];
+  rawIds.forEach((value, index) => {
+    if (typeof value !== 'string' && typeof value !== 'number') {
+      invalidPositions.push(index + 1);
+      return;
+    }
+    const profileId = String(value).trim();
+    if (!profileId || profileId.length > 128 || /[\u0000-\u001f\u007f\s]/.test(profileId)) {
+      invalidPositions.push(index + 1);
+      return;
+    }
+    if (!seen.has(profileId)) {
+      seen.add(profileId);
+      profileIds.push(profileId);
+    }
+  });
+  if (invalidPositions.length) return { error: `profileIds содержит недопустимые значения в позициях: ${invalidPositions.join(', ')}.` };
+  if (!profileIds.length) return { error: 'Выберите хотя бы один профиль Dolphin.' };
+  if (profileIds.length > MAX_ACCOUNT_CHECK_BATCH_SIZE) return { error: `За одну проверку можно добавить не более ${MAX_ACCOUNT_CHECK_BATCH_SIZE} профилей.` };
+  return { profileIds };
+}
+function summarizeAccountCheckBatch(batch) {
+  const counts = (batch.items || []).reduce((result, item) => {
+    result[item.status] = (result[item.status] || 0) + 1;
+    return result;
+  }, {});
+  return {
+    total: batch.items?.length || 0,
+    queued: counts.queued || 0,
+    running: counts.running || 0,
+    completed: counts.completed || 0,
+    failed: counts.error || 0,
+    manualLoginRequired: counts['manual-login-required'] || 0,
+  };
+}
+function refreshAccountCheckBatchStatus(batch) {
+  const summary = summarizeAccountCheckBatch(batch);
+  const status = summary.queued || summary.running
+    ? 'running'
+    : summary.manualLoginRequired
+      ? 'needs-login'
+      : summary.failed
+        ? 'completed-with-errors'
+        : 'completed';
+  if (batch.status !== status) {
+    batch.status = status;
+    batch.updatedAt = new Date().toISOString();
+  }
+  return summary;
+}
+function publicAccountCheckBatch(batch) {
+  const summary = summarizeAccountCheckBatch(batch);
+  return {
+    id: batch.id,
+    createdAt: batch.createdAt,
+    updatedAt: batch.updatedAt,
+    status: batch.status,
+    ...summary,
+    items: (batch.items || []).map(item => ({
+      profileId: String(item.profileId),
+      status: item.status,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      checkedAt: item.checkedAt || null,
+      message: cleanAccountText(item.message, 240),
+    })),
+  };
+}
+async function runAccountCheckBatchItem(batch, item) {
+  item.status = 'running';
+  item.message = 'Проверяем доступ к YouTube Studio.';
+  item.updatedAt = new Date().toISOString();
+  refreshAccountCheckBatchStatus(batch);
+  saveState();
+  try {
+    const result = await readProfileChannel(item.profileId);
+    item.checkedAt = result.channel.checkedAt;
+    if (result.channel.status === 'manual-login-required') {
+      item.status = 'manual-login-required';
+      item.message = 'В этом профиле нужно завершить ручной вход в YouTube.';
+    } else {
+      item.status = 'completed';
+      item.message = result.channel.status === 'connected'
+        ? 'Канал доступен в YouTube Studio.'
+        : 'Статус профиля считан.';
+    }
+  } catch {
+    // Store only a generic failure state.  The cache must not become a place
+    // for local API responses, browser details, or credential-like data.
+    const failedAccount = cacheAccountStatus(item.profileId, { status: 'error' });
+    item.checkedAt = failedAccount?.checkedAt || new Date().toISOString();
+    item.status = 'error';
+    item.message = 'Проверка профиля не выполнена.';
+    addLog(`Не удалось проверить YouTube-профиль ${item.profileId}`, null, 'error');
+  }
+  item.updatedAt = new Date().toISOString();
+  refreshAccountCheckBatchStatus(batch);
+  saveState();
+}
+async function processAccountCheckBatches() {
+  if (accountCheckBatchPumpRunning) return;
+  accountCheckBatchPumpRunning = true;
+  try {
+    let changed = false;
+    for (const batch of accountCheckBatches) {
+      if (!['queued', 'running'].includes(batch.status)) continue;
+      for (const item of batch.items || []) {
+        if (item.status !== 'queued') continue;
+        if (workerOccupiedProfiles().size >= settings.maxConcurrentTasks) return;
+        const operation = queueProfileOperation({
+          key: `account-check:${batch.id}:${item.profileId}`,
+          profileId: item.profileId,
+          work: () => runAccountCheckBatchItem(batch, item),
+        });
+        if (operation.started) {
+          operation.promise
+            .catch(() => addLog(`Не удалось завершить проверку YouTube-профиля ${item.profileId}`, null, 'error'))
+            .finally(() => {
+              if (backgroundEnabled) processAccountCheckBatches().catch(error => addLog(`Ошибка очереди проверки аккаунтов: ${error.message}`, null, 'error'));
+            });
+        } else if (operation.code === 'workers-busy') {
+          return;
+        }
+      }
+      const before = batch.status;
+      refreshAccountCheckBatchStatus(batch);
+      changed = changed || before !== batch.status;
+    }
+    if (changed) saveState();
+  } finally {
+    accountCheckBatchPumpRunning = false;
+  }
+}
+
 app.post('/api/profiles/:id/youtube-status', async (req, res) => {
   const operation = queueProfileOperation({
     key: `inspect:${req.params.id}`,
@@ -672,6 +1088,9 @@ app.post('/api/profiles/:id/youtube-status', async (req, res) => {
   try {
     res.json(await operation.promise);
   } catch (error) {
+    // A failed read is represented by a generic cache state only; no error
+    // payload from Dolphin or YouTube is persisted in the account cache.
+    try { cacheAccountStatus(req.params.id, { status: 'error' }); } catch {}
     if (/already running/i.test(error.message)) return res.status(409).json({ error: 'Профиль уже запущен вне Creator Flow. Для чтения данных нажмите «Перезапустить и считать».', code: 'profile-already-running' });
     res.status(422).json({ error: error.message });
   }
@@ -708,6 +1127,7 @@ app.patch('/api/settings', (req, res) => {
     if (backgroundEnabled) {
       processScheduledTasks().catch(error => addLog(`Ошибка планировщика: ${error.message}`, null, 'error'));
       processStudioSyncBatches().catch(error => addLog(`Ошибка очереди пакетной синхронизации: ${error.message}`, null, 'error'));
+      processAccountCheckBatches().catch(error => addLog(`Ошибка очереди проверки аккаунтов: ${error.message}`, null, 'error'));
     }
   }
   res.json({ settings: { ...settings }, worker: workerState() });
@@ -716,6 +1136,39 @@ app.get('/api/studio-videos', (req, res) => {
   const profileId = String(req.query.profileId || '');
   const record = studioCache[profileId];
   res.json(record || { profileId, syncedAt: null, videos: [], total: 0 });
+});
+app.get('/api/accounts', (_req, res) => {
+  const accounts = Object.entries(accountStatusCache)
+    .map(([profileId, account]) => publicAccount(profileId, account))
+    .sort((left, right) => Date.parse(right.checkedAt) - Date.parse(left.checkedAt));
+  res.json({ accounts, total: accounts.length });
+});
+app.get('/api/accounts/check-batches', (_req, res) => {
+  res.json({ batches: accountCheckBatches.slice(0, 20).map(publicAccountCheckBatch) });
+});
+app.post('/api/accounts/check-batches', (req, res) => {
+  const normalized = normalizeAccountCheckProfileIds(req.body?.profileIds);
+  if (normalized.error) return res.status(400).json({ error: normalized.error });
+  const now = new Date().toISOString();
+  const batch = {
+    id: crypto.randomUUID(),
+    createdAt: now,
+    updatedAt: now,
+    status: 'queued',
+    items: normalized.profileIds.map(profileId => ({
+      profileId,
+      status: 'queued',
+      createdAt: now,
+      updatedAt: now,
+      message: 'Ожидает свободный поток.',
+    })),
+  };
+  accountCheckBatches.unshift(batch);
+  if (accountCheckBatches.length > 20) accountCheckBatches.splice(20);
+  refreshAccountCheckBatchStatus(batch);
+  saveState();
+  if (backgroundEnabled) processAccountCheckBatches().catch(error => addLog(`Ошибка запуска пакетной проверки аккаунтов: ${error.message}`, null, 'error'));
+  res.status(202).json({ batch: publicAccountCheckBatch(batch), worker: workerState() });
 });
 app.get('/api/studio/sync-batches', (_req, res) => {
   res.json({ batches: studioSyncBatches.slice(0, 20).map(publicStudioBatch) });
@@ -922,10 +1375,101 @@ app.post('/api/tasks/:id/upload/continue', async (req, res) => {
   }
 });
 
+app.post('/api/tasks/bulk', (req, res) => {
+  const profileResult = normalizeBulkProfileIds(req.body?.profileIds);
+  if (profileResult.error) return res.status(400).json({ error: profileResult.error });
+  const videoResult = validateBulkVideoPath(req.body?.videoPath);
+  if (videoResult.error) return res.status(400).json({ error: videoResult.error });
+
+  const titleTemplate = typeof req.body?.titleTemplate === 'string' ? req.body.titleTemplate.trim() : '';
+  if (!titleTemplate) return res.status(400).json({ error: 'titleTemplate is required.' });
+  const description = req.body?.description === undefined ? '' : req.body.description;
+  if (typeof description !== 'string' || description.length > 5000) {
+    return res.status(400).json({ error: 'description must be a string no longer than 5000 characters.' });
+  }
+  const rawTags = req.body?.tags === undefined ? [] : req.body.tags;
+  if (!Array.isArray(rawTags) || rawTags.some(tag => typeof tag !== 'string')) {
+    return res.status(400).json({ error: 'tags must be an array of strings.' });
+  }
+  const tags = rawTags.map(tag => tag.trim()).filter(Boolean);
+  const rawScheduledAt = req.body?.scheduledAt;
+  const autoUpload = req.body?.autoUpload === true;
+  let scheduledAt = null;
+  if (rawScheduledAt !== undefined && rawScheduledAt !== null && rawScheduledAt !== '') {
+    if (typeof rawScheduledAt !== 'string' || !Number.isFinite(Date.parse(rawScheduledAt))) {
+      return res.status(400).json({ error: 'scheduledAt must be an ISO date string when provided.' });
+    }
+    scheduledAt = new Date(rawScheduledAt).toISOString();
+  }
+
+  const titles = profileResult.profileIds.map((profileId, index) => ({
+    profileId,
+    title: fillBulkTitleTemplate(titleTemplate, profileId, index + 1).trim(),
+  }));
+  const invalidTitle = titles.find(item => !item.title || item.title.length > 100);
+  if (invalidTitle) {
+    return res.status(400).json({ error: `titleTemplate produced an invalid title for profile ${invalidTitle.profileId}. Titles must be 1-100 characters.` });
+  }
+
+  const batchId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const created = titles.map(({ profileId, title }) => ({
+    id: crypto.randomUUID(),
+    profileId,
+    videoPath: videoResult.videoPath,
+    title,
+    description,
+    tags,
+    scheduledAt,
+    autoUpload,
+    source: 'bulk-queue',
+    batchId,
+    status: 'queued',
+    createdAt: now,
+    updatedAt: now,
+  }));
+
+  try {
+    tasks.push(...created);
+    saveState();
+  } catch (error) {
+    tasks.splice(tasks.length - created.length, created.length);
+    return res.status(500).json({ error: `Bulk queue was not saved: ${error.message}` });
+  }
+  addLog(`Created ${created.length} queued upload task(s) in bulk batch ${batchId}.`);
+  if (backgroundEnabled && autoUpload) {
+    queueMicrotask(() => processScheduledTasks().catch(error => addLog(`Ошибка автоматического запуска пакетной очереди: ${error.message}`, batchId, 'error')));
+  }
+  res.status(201).json({
+    batchId,
+    created: created.length,
+    profileIds: profileResult.profileIds,
+    autoUpload,
+    manualStartRequired: !autoUpload,
+    tasks: created.map(publicTask),
+  });
+});
+
 app.post('/api/tasks', (req, res) => {
   const { profileId, videoPath, title, description = '', tags = [], scheduledAt = null, autoUpload = true } = req.body || {};
-  if (!profileId || !videoPath || !title) return res.status(400).json({ error: 'profileId, videoPath и title обязательны' });
-  const task = { id: crypto.randomUUID(), profileId, videoPath, title, description, tags: Array.isArray(tags) ? tags : [], scheduledAt, autoUpload: Boolean(autoUpload), status: 'queued', createdAt: new Date().toISOString() };
+  const profileResult = normalizeBulkProfileIds([profileId]);
+  if (profileResult.error) return res.status(400).json({ error: 'Выберите корректный профиль Dolphin.' });
+  const videoResult = validateBulkVideoPath(videoPath);
+  if (videoResult.error) return res.status(400).json({ error: 'Укажите существующий файл ролика.' });
+  const safeTitle = typeof title === 'string' ? title.trim() : '';
+  if (!safeTitle || safeTitle.length > 100) return res.status(400).json({ error: 'Заголовок должен содержать от 1 до 100 символов.' });
+  if (typeof description !== 'string' || description.length > 5000) return res.status(400).json({ error: 'Описание должно быть строкой до 5000 символов.' });
+  if (!Array.isArray(tags) || tags.some(tag => typeof tag !== 'string')) return res.status(400).json({ error: 'Теги должны быть списком строк.' });
+  let safeScheduledAt = null;
+  if (scheduledAt) {
+    if (typeof scheduledAt !== 'string' || !Number.isFinite(Date.parse(scheduledAt))) return res.status(400).json({ error: 'Время запуска указано неверно.' });
+    safeScheduledAt = new Date(scheduledAt).toISOString();
+  }
+  const task = {
+    id: crypto.randomUUID(), profileId: profileResult.profileIds[0], videoPath: videoResult.videoPath,
+    title: safeTitle, description, tags: tags.map(tag => tag.trim()).filter(Boolean), scheduledAt: safeScheduledAt,
+    autoUpload: Boolean(autoUpload), source: 'single', status: 'queued', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  };
   tasks.push(task);
   saveState();
   if (backgroundEnabled && task.autoUpload) queueMicrotask(() => processScheduledTasks().catch(error => addLog(`Ошибка автоматического запуска: ${error.message}`, task.id, 'error')));
