@@ -25,6 +25,7 @@ const linkTitleFieldName = /(?:\blink\s*title\b|\btitle\s*(?:of\s*)?link\b|\u043
 const linkUrlFieldName = /(?:\blink\s*(?:url|address)\b|\burl\b|\bwebsite\b|\u0430\u0434\u0440\u0435\u0441\s+\u0441\u0441\u044b\u043b\u043a\u0438|\u0441\u0441\u044b\u043b\u043a\u0430)/i;
 const saveSuccessText = /(?:\b(?:changes?|settings?)\s+(?:were\s+)?(?:saved|published|updated)\b|\b(?:published|saved)\b|\u0438\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u044f\s+(?:\u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u044b|\u043e\u043f\u0443\u0431\u043b\u0438\u043a\u043e\u0432\u0430\u043d\u044b)|\u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u043e|\u043e\u043f\u0443\u0431\u043b\u0438\u043a\u043e\u0432\u0430\u043d\u043e)/i;
 const channelNameSelector = '#channel-name, ytcp-channel-name, [id="channel-name"]';
+const modernChannelNameInputSelector = 'input.ytcpChannelEditingChannelNameFormInput, input[placeholder*="название канала" i], input[placeholder*="channel name" i]';
 const channelAvatarSelector = 'ytcp-avatar img, ytcp-channel-avatar img, img[src*="yt3.ggpht.com"], img#img';
 const fileInputSelector = 'input[type="file"]';
 const modernBrandingFileSelectors = Object.freeze({
@@ -423,6 +424,19 @@ async function hasCurrentProfileEditorSurface(page, deadline, stage) {
   return Boolean(description);
 }
 
+async function waitForLocatorCount(page, locator, deadline, stage, { maximumWaitMs = 3_000 } = {}) {
+  const expiresAt = Date.now() + Math.min(maximumWaitMs, deadline.remaining(`${stage}: wait`));
+  let count = 0;
+  while (Date.now() < expiresAt) {
+    count = await withinDeadline(deadline, stage, () => locator.count()).catch(() => 0);
+    if (count) return count;
+    await withinDeadline(deadline, `${stage}: wait`, () => (
+      page.waitForTimeout(Math.min(250, deadline.remaining(`${stage}: wait`)))
+    ));
+  }
+  return count;
+}
+
 async function findBrandingFileInput(page, semantic, deadline, stage) {
   // These are the current Studio component hosts observed on the Profile
   // editor. They are stronger than a generic score and deliberately exclude
@@ -430,7 +444,7 @@ async function findBrandingFileInput(page, semantic, deadline, stage) {
   if (await hasCurrentProfileEditorSurface(page, deadline, stage)) {
     const directSelector = modernBrandingFileSelectors[semantic];
     const direct = page.locator(directSelector);
-    const directCount = await withinDeadline(deadline, `${stage}: modern control`, () => direct.count()).catch(() => 0);
+    const directCount = await waitForLocatorCount(page, direct, deadline, `${stage}: modern control`);
     if (directCount === 1) return direct.first();
     if (directCount > 1) {
       throw new Error(`YouTube Studio exposed more than one ${semantic} image field. Nothing was saved.`);
@@ -518,55 +532,33 @@ async function fillAndVerifyEditorField(field, value, deadline, stage) {
 
 async function fillChannelName(page, value, deadline) {
   if (!value) return false;
-  if (await fillByLabel(page, channelNameFieldName, value, deadline, 'Название канала')) return true;
-  const field = await firstVisibleFieldWithAttribute(
-    page.locator('input[placeholder]'),
-    ['placeholder'],
-    channelNamePlaceholder,
-    deadline,
-    'Название канала',
-  );
-  if (field) return fillAndVerifyEditorField(field, value, deadline, 'Название канала');
-  const semanticField = await findSemanticEditorControl(
-    page,
-    profileTextFieldSelector,
-    'name',
-    deadline,
-    'Название канала: semantic control',
-    { editable: true, visible: true },
-  );
-  if (!semanticField.locator) return false;
-  return fillAndVerifyEditorField(semanticField.locator, value, deadline, 'Название канала');
+  const field = await findChannelTextEditor(page, 'name', deadline, 'Название канала');
+  return field ? fillAndVerifyEditorField(field, value, deadline, 'Название канала') : false;
 }
 
 async function fillChannelDescription(page, value, deadline) {
   if (!value) return false;
-  if (await fillByLabel(page, channelDescriptionFieldName, value, deadline, 'Описание канала')) return true;
-  const field = await firstVisibleFieldWithAttribute(
-    page.locator('textarea, [contenteditable="true"]'),
-    ['aria-label', 'placeholder'],
-    descriptionFieldHint,
-    deadline,
-    'Описание канала',
-  );
-  if (field) return fillAndVerifyEditorField(field, value, deadline, 'Описание канала');
-  const semanticField = await findSemanticEditorControl(
-    page,
-    profileTextFieldSelector,
-    'description',
-    deadline,
-    'Описание канала: semantic control',
-    { editable: true, visible: true },
-  );
-  if (!semanticField.locator) return false;
-  return fillAndVerifyEditorField(semanticField.locator, value, deadline, 'Описание канала');
+  const field = await findChannelTextEditor(page, 'description', deadline, 'Описание канала');
+  return field ? fillAndVerifyEditorField(field, value, deadline, 'Описание канала') : false;
 }
 
 async function findChannelTextEditor(page, semantic, deadline, stage) {
+  const expiresAt = Date.now() + Math.min(8_000, deadline.remaining(`${stage}: wait for editor`));
+  while (Date.now() < expiresAt) {
+    const field = await findChannelTextEditorOnce(page, semantic, deadline, stage);
+    if (field) return field;
+    await withinDeadline(deadline, `${stage}: wait for editor`, () => (
+      page.waitForTimeout(Math.min(250, deadline.remaining(`${stage}: wait for editor`)))
+    ));
+  }
+  return null;
+}
+
+async function findChannelTextEditorOnce(page, semantic, deadline, stage) {
   const labelPattern = semantic === 'name' ? channelNameFieldName : channelDescriptionFieldName;
   const placeholderPattern = semantic === 'name' ? channelNamePlaceholder : descriptionFieldHint;
   const primarySelector = semantic === 'name'
-    ? 'input[placeholder]'
+    ? modernChannelNameInputSelector
     : 'textarea, [contenteditable="true"], [role="textbox"]';
   const byLabel = await firstVisible(page.getByRole('textbox', { name: labelPattern }), deadline, `${stage}: labelled field`);
   if (byLabel) return byLabel;

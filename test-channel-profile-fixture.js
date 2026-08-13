@@ -81,6 +81,10 @@ class FixtureLocator {
     return new FixtureLocator([this.items[index]]);
   }
 
+  first() {
+    return this.nth(0);
+  }
+
   async isVisible() {
     return Boolean(this.items[0]?.visible);
   }
@@ -115,7 +119,18 @@ class ProfileDomFixture {
     return this.currentUrl;
   }
 
+  async waitForTimeout() {
+    // The fixture has no asynchronous renderer; the production helper still
+    // receives the same Playwright surface it uses while waiting for Studio.
+  }
+
   locator(selector) {
+    if (selector === 'ytcp-banner-upload input[type="file"]') {
+      return new FixtureLocator(this.elements.filter(element => element.id === 'banner'));
+    }
+    if (selector === 'ytcp-profile-image-upload input[type="file"]') {
+      return new FixtureLocator(this.elements.filter(element => element.id === 'avatar' || element.id === 'avatar-second'));
+    }
     if (selector === 'input[type="file"]') {
       return new FixtureLocator(this.elements.filter(element => element.type === 'file'));
     }
@@ -248,7 +263,7 @@ try {
   page = modernProfileFixture({ duplicateAvatar: true });
   await assert.rejects(
     () => fixtureWorker.findBrandingFileInput(page, 'avatar', deadline(), 'ambiguous avatar'),
-    /more than one matching field/i,
+    /more than one.*avatar image field/i,
   );
 
   // An unlabeled modern file field is equally unsafe: no semantic match means
