@@ -729,13 +729,7 @@ async function readLocatorFormValue(locator, deadline, stage) {
 }
 
 async function readCurrentEditorChannelName(page, deadline) {
-  const field = await firstVisibleFieldWithAttribute(
-    page.locator('input[placeholder]'),
-    ['placeholder'],
-    channelNamePlaceholder,
-    deadline,
-    'Чтение поля названия канала',
-  );
+  const field = await findChannelTextEditor(page, 'name', deadline, 'Чтение поля названия канала');
   return field ? readLocatorFormValue(field, deadline, 'Чтение значения названия канала') : '';
 }
 
