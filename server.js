@@ -2163,16 +2163,42 @@ app.post('/api/channels/tasks/bulk', (req, res) => {
 });
 
 app.post('/api/channels/tasks', (req, res) => {
-  const { profileId, name = '', description = '', links = [], avatarPath = '', bannerPath = '' } = req.body || {};
-  if (!profileId) return res.status(400).json({ error: 'profileId обязателен' });
-  const safeLinks = Array.isArray(links) ? links.filter(link => link && typeof link.title === 'string' && typeof link.url === 'string') : [];
-  if (!name && !description && !safeLinks.length && !avatarPath && !bannerPath) return res.status(400).json({ error: 'Укажите хотя бы одно изменение оформления канала' });
-  const task = { id: crypto.randomUUID(), profileId, name, description, links: safeLinks, avatarPath, bannerPath, status: 'queued', createdAt: new Date().toISOString() };
-  channelTasks.unshift(task); saveState(); addLog(`Задача оформления канала создана для профиля ${profileId}`, task.id); res.status(201).json(task);
+  const profileResult = normalizeBulkProfileIds([req.body?.profileId]);
+  if (profileResult.error) return res.status(400).json({ error: profileResult.error });
+  let name;
+  let description;
+  let links;
+  let avatarPath;
+  let bannerPath;
+  try {
+    name = normalizeChannelTemplate(req.body?.name, 'Название канала', 100);
+    description = normalizeChannelTemplate(req.body?.description, 'Описание канала', 5_000);
+    links = normalizeChannelLinks(req.body?.links);
+    avatarPath = normalizeChannelAssetPath(req.body?.avatarPath, 'Аватар канала');
+    bannerPath = normalizeChannelAssetPath(req.body?.bannerPath, 'Баннер канала');
+  } catch (error) {
+    return res.status(error?.statusCode || 400).json({ error: error.message });
+  }
+  if (!name && !description && !links.length && !avatarPath && !bannerPath) {
+    return res.status(400).json({ error: 'Укажите хотя бы одно изменение оформления канала.' });
+  }
+  const task = {
+    id: crypto.randomUUID(), profileId: profileResult.profileIds[0], name, description, links,
+    avatarPath, bannerPath, source: 'single', status: 'queued', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  };
+  try {
+    channelTasks.unshift(task);
+    saveState();
+  } catch (error) {
+    channelTasks.shift();
+    return res.status(500).json({ error: `Задача оформления не сохранена: ${error.message}` });
+  }
+  addLog(`Задача оформления канала создана для профиля ${task.profileId}`, task.id);
+  res.status(201).json(task);
 });
 
 async function runChannelTask(task) {
-  task.status = 'starting-profile'; task.updatedAt = new Date().toISOString(); saveState();
+  task.status = 'starting-profile'; task.error = ''; task.updatedAt = new Date().toISOString(); saveState();
   try {
     const profileResult = await startDolphinForAutomation(task.profileId);
     const wsEndpoint = getAutomationEndpoint(profileResult);
@@ -2180,6 +2206,9 @@ async function runChannelTask(task) {
     else {
       task.status = 'applying'; saveState();
       task.result = await updateChannelBranding({ wsEndpoint, name: task.name, description: task.description, links: task.links, avatarPath: task.avatarPath, bannerPath: task.bannerPath });
+      if (task.result.status === 'applied' && task.result.saveConfirmed !== true) {
+        throw new Error('YouTube Studio did not independently confirm saving the channel changes.');
+      }
       task.status = task.result.status === 'manual-login-required' ? 'manual-login-required' : 'completed';
       task.message = task.status === 'completed' ? 'Оформление канала обновлено.' : 'Выполните ручной вход в YouTube в открытом профиле и повторите запуск.';
     }

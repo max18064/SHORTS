@@ -171,8 +171,13 @@ function assertWorkerSafetyContract(source) {
   assert.match(source, /function findBrandingFileInput\(/, 'Image selection must be centralized.');
   assert.match(source, /findSemanticEditorControl\(page, fileInputSelector, semantic/, 'Modern image fields must be selected semantically.');
   assert.match(source, /setAndVerifyBrandingFile\(/, 'Image selection must be read back before saving.');
+  assert.match(source, /ytcp-banner-upload input\[type="file"\]/, 'Modern banner host must remain explicitly mapped.');
+  assert.match(source, /ytcp-profile-image-upload input\[type="file"\]/, 'Modern profile-photo host must remain explicitly mapped.');
   assert.match(source, /verifyChannelEditorValue\(page, 'name', name/, 'Channel name must be re-read before saving.');
   assert.match(source, /verifyChannelEditorValue\(page, 'description', description/, 'Channel description must be re-read before saving.');
+  assert.match(source, /addAndVerifyChannelLinks\(/, 'Links must be filled through their own labelled controls.');
+  assert.match(source, /waitForStudioSaveSignal\(/, 'Studio must expose a save transition before a task is completed.');
+  assert.match(source, /useOwnedPage: true/, 'Branding work must use an app-owned Studio tab.');
 
   const modernGuard = source.indexOf('if (await hasCurrentProfileEditorSurface(page, deadline, stage))');
   const legacyFallback = source.indexOf("const legacyIndex = semantic === 'avatar' ? 0 : 1;");
@@ -187,6 +192,9 @@ function assertWorkerSafetyContract(source) {
   const savedNameVerification = source.indexOf("await verifyChannelEditorValue(page, 'name', name, deadline);", reload);
   const savedDescriptionVerification = source.indexOf("await verifyChannelEditorValue(page, 'description', description, deadline);", reload);
   assert.ok(reload > publish && savedNameVerification > reload && savedDescriptionVerification > reload, 'Saved channel fields must be re-read after reload.');
+
+  const saveConfirmation = source.indexOf('saveConfirmed: true', reload);
+  assert.ok(saveConfirmation > savedDescriptionVerification, 'A completed branding result must declare independent save confirmation only after reload checks.');
 }
 
 async function importFixtureWorker() {

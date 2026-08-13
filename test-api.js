@@ -21,9 +21,14 @@ const outputPath = path.join(process.cwd(), '.test-output.mp4');
 const processingOutputPath = path.join(testStateDir, 'batch-processed.mp4');
 const bulkVideoPath = path.join(testStateDir, 'bulk-source.mp4');
 const channelAvatarPath = path.join(testStateDir, 'channel-avatar.png');
+const channelBannerPath = path.join(testStateDir, 'channel-banner.png');
+const channelAssetDirectory = path.join(testStateDir, 'channel-asset-directory');
 fs.writeFileSync(bulkVideoPath, 'bulk queue test source');
 fs.writeFileSync(channelAvatarPath, 'channel branding test asset');
+fs.writeFileSync(channelBannerPath, 'channel branding banner asset');
+fs.mkdirSync(channelAssetDirectory);
 const dolphinCalls = [];
+const localDolphinCalls = [];
 const officialFingerprint = {
   platformName: 'Win32',
   useragent: { mode: 'manual', value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
@@ -70,7 +75,14 @@ const localDolphinMock = http.createServer((request, response) => {
   // The account-check smoke path intentionally returns no CDP endpoint. This
   // exercises the read-only `automation-unavailable` cache path without
   // opening a browser or relying on a real Dolphin installation.
-  if (request.method === 'GET' && /\/v1\.0\/browser_profiles\/1\/start$/.test(url.pathname)) {
+  const startMatch = request.method === 'GET'
+    ? url.pathname.match(/^\/v1\.0\/browser_profiles\/([^/]+)\/start$/)
+    : null;
+  if (startMatch) {
+    localDolphinCalls.push({ profileId: decodeURIComponent(startMatch[1]), automation: url.searchParams.get('automation') });
+    if (decodeURIComponent(startMatch[1]) === 'mock-start-failure') {
+      return sendJson(response, 503, { error: 'Isolated Dolphin start failure' });
+    }
     return sendJson(response, 200, { success: true });
   }
   return sendJson(response, 200, { success: true });
@@ -264,10 +276,66 @@ try {
   const batches = await (await fetch(`${base}/api/studio/sync-batches`)).json();
   assert.equal(batches.batches.length, 1);
   assert.equal(batches.batches[0].queued, 1);
-  const channelTask = await (await fetch(`${base}/api/channels/tasks`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ profileId: 'test-profile', name: 'Test channel', description: 'Test description', links: [{ title: 'Site', url: 'https://example.com' }] }) })).json();
+  const channelTaskResponse = await fetch(`${base}/api/channels/tasks`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      profileId: ' test-profile ',
+      name: '  Test channel  ',
+      description: '  Test description  ',
+      links: [{ title: ' Site ', url: 'https://example.com/channel' }],
+      avatarPath: channelAvatarPath,
+      bannerPath: channelBannerPath,
+    }),
+  });
+  assert.equal(channelTaskResponse.status, 201);
+  const channelTask = await channelTaskResponse.json();
   assert.equal(channelTask.status, 'queued');
+  assert.equal(channelTask.source, 'single');
+  assert.equal(channelTask.profileId, 'test-profile');
+  assert.equal(channelTask.name, 'Test channel');
+  assert.equal(channelTask.description, 'Test description');
+  assert.deepEqual(channelTask.links, [{ title: 'Site', url: 'https://example.com/channel' }]);
+  assert.equal(channelTask.avatarPath, path.resolve(channelAvatarPath));
+  assert.equal(channelTask.bannerPath, path.resolve(channelBannerPath));
   const channelTasks = await (await fetch(`${base}/api/channels/tasks`)).json();
   assert.equal(channelTasks.tasks.length, 1);
+  const rejectedSingleChannelRequests = [
+    { profileId: 'test-profile', links: [{ title: 'Bad', url: 'javascript:alert(1)' }] },
+    { profileId: 'test-profile', links: [{ title: 'Credentials', url: 'https://user:pass@example.com' }] },
+    { profileId: 'test-profile', avatarPath: channelAssetDirectory },
+    { profileId: 'test-profile', name: 'Bad\u0001name' },
+    { profileId: 'test-profile' },
+  ];
+  for (const body of rejectedSingleChannelRequests) {
+    const rejected = await fetch(`${base}/api/channels/tasks`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    assert.equal(rejected.status, 400);
+  }
+  assert.equal((await (await fetch(`${base}/api/channels/tasks`)).json()).tasks.length, 1);
+  const runSingleChannel = await fetch(`${base}/api/channels/tasks/${channelTask.id}/run`, { method: 'POST' });
+  assert.equal(runSingleChannel.status, 200);
+  const manualLoginChannelTask = await runSingleChannel.json();
+  assert.equal(manualLoginChannelTask.status, 'manual-login-required');
+  assert.equal(manualLoginChannelTask.result, undefined);
+  assert.ok(localDolphinCalls.some(call => call.profileId === 'test-profile'));
+  const rerunSingleChannel = await fetch(`${base}/api/channels/tasks/${channelTask.id}/run`, { method: 'POST' });
+  assert.equal(rerunSingleChannel.status, 200);
+  assert.equal((await rerunSingleChannel.json()).status, 'manual-login-required');
+  const failedChannelTaskResponse = await fetch(`${base}/api/channels/tasks`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ profileId: 'mock-start-failure', description: 'Failure transition test' }),
+  });
+  assert.equal(failedChannelTaskResponse.status, 201);
+  const failedChannelTask = await failedChannelTaskResponse.json();
+  const failedChannelRun = await fetch(`${base}/api/channels/tasks/${failedChannelTask.id}/run`, { method: 'POST' });
+  assert.equal(failedChannelRun.status, 200);
+  const failedChannelResult = await failedChannelRun.json();
+  assert.equal(failedChannelResult.status, 'error');
+  assert.ok(failedChannelResult.error);
+  const retryFailedChannel = await fetch(`${base}/api/channels/tasks/${failedChannelTask.id}/run`, { method: 'POST' });
+  assert.equal(retryFailedChannel.status, 200);
+  assert.equal((await retryFailedChannel.json()).status, 'error');
   const bulkChannelResponse = await fetch(`${base}/api/channels/tasks/bulk`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -276,6 +344,7 @@ try {
       name: 'Channel {index} for {profileId}',
       description: 'Description {index}: {profileId}',
       avatarPath: channelAvatarPath,
+      bannerPath: channelBannerPath,
       links: [{ title: 'Website', url: 'https://example.com/channel' }],
     }),
   });
@@ -291,6 +360,8 @@ try {
   assert.deepEqual(bulkChannel.tasks.map(task => task.name), ['Channel 1 for channel-profile-a', 'Channel 2 for channel-profile-b']);
   assert.deepEqual(bulkChannel.tasks.map(task => task.description), ['Description 1: channel-profile-a', 'Description 2: channel-profile-b']);
   assert.ok(bulkChannel.tasks.every(task => task.avatarPath === path.resolve(channelAvatarPath)));
+  assert.ok(bulkChannel.tasks.every(task => task.bannerPath === path.resolve(channelBannerPath)));
+  assert.ok(bulkChannel.tasks.every(task => task.links.length === 1 && task.links[0].url === 'https://example.com/channel'));
   const channelBatches = await (await fetch(`${base}/api/channels/batches`)).json();
   assert.equal(channelBatches.batches.length, 1);
   assert.equal(channelBatches.batches[0].id, bulkChannel.batchId);
@@ -305,6 +376,13 @@ try {
   assert.equal(autoBulkChannel.autoRun, true);
   assert.equal(autoBulkChannel.manualStartRequired, false);
   assert.equal(autoBulkChannel.tasks[0].status, 'queued');
+  const runAutoBulkChannel = await fetch(`${base}/api/channels/tasks/${autoBulkChannel.tasks[0].id}/run`, { method: 'POST' });
+  assert.equal(runAutoBulkChannel.status, 200);
+  assert.equal((await runAutoBulkChannel.json()).status, 'manual-login-required');
+  const channelBatchesAfterRun = await (await fetch(`${base}/api/channels/batches`)).json();
+  const autoRunBatch = channelBatchesAfterRun.batches.find(batch => batch.id === autoBulkChannel.batchId);
+  assert.equal(autoRunBatch.manualLoginRequired, 1);
+  assert.equal(autoRunBatch.completed, 0);
   const channelTaskCountBeforeRejectedBulk = (await (await fetch(`${base}/api/channels/tasks`)).json()).tasks.length;
   const rejectedChannelBulk = await fetch(`${base}/api/channels/tasks/bulk`, {
     method: 'POST',
@@ -330,6 +408,27 @@ try {
       profileId: 'recovery-profile',
       name: 'Interrupted task',
       status: 'applying',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    }, {
+      id: 'starting-channel-task',
+      profileId: 'recovery-starting-profile',
+      description: 'Interrupted before Studio opened',
+      status: 'starting-profile',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    }, {
+      id: 'queued-channel-task',
+      profileId: 'recovery-queued-profile',
+      description: 'Must remain queued after restart',
+      status: 'queued',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    }, {
+      id: 'manual-channel-task',
+      profileId: 'recovery-manual-profile',
+      description: 'Manual login must remain actionable',
+      status: 'manual-login-required',
       createdAt: '2026-01-01T00:00:00.000Z',
       updatedAt: '2026-01-01T00:00:00.000Z',
     }],
@@ -363,7 +462,10 @@ try {
     ]);
     const channelPayload = await channelResponse.json();
     const processingPayload = await processingResponse.json();
-    const payload = { tasks: channelPayload.tasks, processing: processingPayload };
+    const retryResponse = await fetch('http://127.0.0.1:' + address.port + '/api/channels/tasks/interrupted-channel-task/run', { method: 'POST' });
+    const retryTask = await retryResponse.json();
+    const finalChannelPayload = await (await fetch('http://127.0.0.1:' + address.port + '/api/channels/tasks')).json();
+    const payload = { tasks: channelPayload.tasks, retryTask, finalTasks: finalChannelPayload.tasks, processing: processingPayload };
     await new Promise(resolve => server.close(resolve));
     previousLog(JSON.stringify(payload));
   `;
@@ -379,12 +481,18 @@ try {
   });
   const recoveredProbe = JSON.parse(recoveryProbeResult.stdout.trim());
   const recoveredChannelTasks = recoveredProbe.tasks;
-  assert.equal(recoveredChannelTasks.length, 1);
+  assert.equal(recoveredChannelTasks.length, 4);
   assert.equal(recoveredChannelTasks[0].status, 'recovery-needed');
+  assert.equal(recoveredChannelTasks[1].status, 'recovery-needed');
+  assert.equal(recoveredChannelTasks[2].status, 'queued');
+  assert.equal(recoveredChannelTasks[3].status, 'manual-login-required');
   assert.match(recoveredChannelTasks[0].message, /прервано перезапуском/i);
   assert.equal(recoveredProbe.processing.batches.length, 1);
   assert.equal(recoveredProbe.processing.batches[0].status, 'needs-attention');
   assert.equal(recoveredProbe.processing.batches[0].items[0].status, 'recovery-needed');
+  assert.equal(recoveredProbe.retryTask.status, 'manual-login-required');
+  assert.equal(recoveredProbe.finalTasks.find(task => task.id === 'interrupted-channel-task').status, 'manual-login-required');
+  assert.ok(localDolphinCalls.some(call => call.profileId === 'recovery-profile'));
   const invalidLibraryUpload = await fetch(`${base}/api/library/upload?name=broken.mp4`, {
     method: 'POST',
     headers: { 'content-type': 'application/octet-stream' },
@@ -450,6 +558,8 @@ try {
   fs.rmSync(processingOutputPath, { force: true });
   fs.rmSync(bulkVideoPath, { force: true });
   fs.rmSync(channelAvatarPath, { force: true });
+  fs.rmSync(channelBannerPath, { force: true });
+  fs.rmSync(channelAssetDirectory, { recursive: true, force: true });
   fs.rmSync(testStateDir, { recursive: true, force: true });
   if (productionHashBefore !== null) {
     const productionHashAfter = crypto.createHash('sha256').update(fs.readFileSync(productionStatePath)).digest('hex');
